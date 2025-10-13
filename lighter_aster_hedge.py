@@ -1839,15 +1839,19 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                     leverage = position.get('leverage', config.leverage)
                     stop_loss_pct = calculate_stop_loss_percentage(leverage)
 
+                    # Calculate position value for percentage calculation and position size string
+                    metadata = position.get('metadata', {})
+                    size_base = metadata.get('size_base', 0.0)
+                    avg_mid = metadata.get('avg_mid', 0.0)
+                    position_value = size_base * avg_mid if size_base and avg_mid else config.notional_per_position
+
+                    # Format position size string
+                    base_asset = position['symbol'].replace('USDT', '')
+                    size_str = f"{Colors.MAGENTA}{size_base:.4f} {base_asset} / ${position_value:,.2f}{Colors.RESET}" if size_base and position_value else ""
+
                     # Fetch current PnL from both exchanges
                     try:
                         aster_pnl, lighter_pnl = await get_position_pnls(env, aster, position['symbol'])
-
-                        # Calculate position value for percentage calculation
-                        metadata = position.get('metadata', {})
-                        size_base = metadata.get('size_base', 0.0)
-                        avg_mid = metadata.get('avg_mid', 0.0)
-                        position_value = size_base * avg_mid if size_base and avg_mid else config.notional_per_position
 
                         # Calculate worst PnL (most negative) and determine exchange
                         worst_pnl = None
@@ -1928,7 +1932,8 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                                 total_pnl_str = f" | Total PnL: {total_color}${total_pnl:+.2f} ({total_pnl_pct:+.1f}%){Colors.RESET}"
 
                             logger.info(
-                                f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} - "
+                                f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} "
+                                f"({size_str}) - "
                                 f"{Colors.BLUE}{Colors.BOLD}{time_remaining:.2f} hours{Colors.RESET} remaining | "
                                 f"Stop-loss: {Colors.YELLOW}{stop_loss_pct:.2f}%{Colors.RESET} | "
                                 f"Worst PnL: {pnl_str}{total_pnl_str}"
@@ -1945,14 +1950,16 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                                 total_pnl_str = f" | Total PnL: {total_color}${total_pnl:+.2f}{Colors.RESET}"
 
                             logger.info(
-                                f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} - "
+                                f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} "
+                                f"({size_str}) - "
                                 f"{Colors.BLUE}{Colors.BOLD}{time_remaining:.2f} hours{Colors.RESET} remaining | "
                                 f"Stop-loss: {Colors.YELLOW}{stop_loss_pct:.2f}%{Colors.RESET} | "
                                 f"Worst PnL: {pnl_str}{total_pnl_str}"
                             )
                         else:
                             logger.info(
-                                f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} - "
+                                f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} "
+                                f"({size_str}) - "
                                 f"{Colors.BLUE}{Colors.BOLD}{time_remaining:.2f} hours{Colors.RESET} remaining | "
                                 f"Stop-loss: {Colors.YELLOW}{stop_loss_pct:.2f}%{Colors.RESET} | "
                                 f"Worst PnL: {Colors.GRAY}N/A{Colors.RESET}"
@@ -1960,7 +1967,8 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                     except Exception as e:
                         logger.debug(f"Failed to fetch PnL for holding message: {e}")
                         logger.info(
-                            f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} - "
+                            f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} "
+                            f"({size_str}) - "
                             f"{Colors.BLUE}{Colors.BOLD}{time_remaining:.2f} hours{Colors.RESET} remaining | "
                             f"Stop-loss: {Colors.YELLOW}{stop_loss_pct:.2f}%{Colors.RESET}"
                         )
