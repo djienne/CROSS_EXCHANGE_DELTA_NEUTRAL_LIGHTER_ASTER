@@ -237,6 +237,7 @@ class BotConfig:
     max_spread_pct: float = 0.15
     enable_stop_loss: bool = True
     funding_table_refresh_minutes: float = 5.0
+    capital_safety_margin: float = 0.95
 
     @staticmethod
     def load_from_file(config_file: str) -> 'BotConfig':
@@ -260,7 +261,8 @@ class BotConfig:
                 'min_net_apr_threshold': 5.0,
                 'max_spread_pct': 0.15,
                 'enable_stop_loss': True,
-                'funding_table_refresh_minutes': 5.0
+                'funding_table_refresh_minutes': 5.0,
+                'capital_safety_margin': 0.95
             }
 
             for key, default_value in defaults.items():
@@ -300,7 +302,8 @@ class BotConfig:
                 'min_net_apr_threshold': 5.0,
                 'max_spread_pct': 0.15,
                 'enable_stop_loss': True,
-                'funding_table_refresh_minutes': 5.0
+                'funding_table_refresh_minutes': 5.0,
+                'capital_safety_margin': 0.95
             }
 
             for key, default_value in defaults.items():
@@ -690,16 +693,46 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
     aster_apr: Optional[float] = None
     lighter_apr: Optional[float] = None
 
-    async def fetch_aster_rate() -> Optional[float]:
+    async def fetch_aster_rate() -> Optional[Tuple[float, int]]:
+        """
+        Fetch Aster funding rate and detect funding interval.
+
+        Returns:
+            Tuple of (rate, periods_per_day) or None if failed
+        """
         logger.debug(f"fetch_aster_rate: Starting for {symbol}")
         try:
-            history = await aster.get_funding_rate_history(symbol, limit=1)
-            if history and len(history) > 0:
-                rate = float(history[0].get('fundingRate', 0))
-                logger.debug(f"fetch_aster_rate: Got rate {rate} for {symbol}")
-                return rate
-            logger.warning(f"fetch_aster_rate: No funding history for {symbol}")
-            return None
+            # Fetch 2 records to detect funding interval
+            history = await aster.get_funding_rate_history(symbol, limit=2)
+            if not history or len(history) == 0:
+                logger.warning(f"fetch_aster_rate: No funding history for {symbol}")
+                return None
+
+            rate = float(history[0].get('fundingRate', 0))
+            logger.debug(f"fetch_aster_rate: Got rate {rate} for {symbol}")
+
+            # Detect funding interval from timestamps
+            periods_per_day = 6  # Default: every 4 hours
+            if len(history) >= 2:
+                try:
+                    time1 = int(history[0].get('fundingTime', 0))
+                    time2 = int(history[1].get('fundingTime', 0))
+
+                    if time1 and time2:
+                        interval_ms = abs(time1 - time2)
+                        interval_hours = interval_ms / (1000 * 60 * 60)
+
+                        # Calculate periods per day based on interval
+                        if interval_hours > 0:
+                            periods_per_day = round(24 / interval_hours)
+                            logger.debug(
+                                f"fetch_aster_rate: Detected {interval_hours:.1f}h funding interval "
+                                f"for {symbol} ({periods_per_day} periods/day)"
+                            )
+                except Exception as e:
+                    logger.debug(f"fetch_aster_rate: Could not detect interval for {symbol}, using default: {e}")
+
+            return (rate, periods_per_day)
         except Exception as exc:
             logger.error("Error fetching Aster funding for %s: %s", symbol, exc, exc_info=True)
             return None
@@ -752,13 +785,23 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
 
     # Fetch funding rates and spread
     logger.debug(f"fetch_symbol_funding: Gathering data from both exchanges for {symbol}")
-    aster_rate_decimal, lighter_rate_decimal, spread_data = await asyncio.gather(
+    aster_result, lighter_rate_decimal, spread_data = await asyncio.gather(
         fetch_aster_rate(),
         fetch_lighter_rate(),
         fetch_symbol_spread(symbol, env, aster)
     )
     spread_pct, aster_mid, lighter_mid = spread_data
-    logger.debug(f"fetch_symbol_funding: Received aster_rate={aster_rate_decimal}, lighter_rate={lighter_rate_decimal}, spread={spread_pct} for {symbol}")
+
+    # Unpack Aster result (rate, periods_per_day)
+    aster_rate_decimal = None
+    aster_periods_per_day = 6  # Default
+    if aster_result is not None:
+        aster_rate_decimal, aster_periods_per_day = aster_result
+
+    logger.debug(
+        f"fetch_symbol_funding: Received aster_rate={aster_rate_decimal} ({aster_periods_per_day} periods/day), "
+        f"lighter_rate={lighter_rate_decimal}, spread={spread_pct} for {symbol}"
+    )
 
     if aster_rate_decimal is None or lighter_rate_decimal is None:
         missing = []
@@ -792,10 +835,10 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
             "lighter_rate": lighter_rate_decimal * 100 if lighter_rate_decimal is not None else None,
         }
 
-    # Aster funding happens every 8 hours (3 times per day)
-    # Lighter funding happens every 1 hour (24 times per day)
-    aster_apr = _calculate_apr(aster_rate_decimal, 3)
-    lighter_apr = _calculate_apr(lighter_rate_decimal, 24)
+    # Aster funding interval varies by symbol (detected dynamically from API)
+    # Lighter funding happens every 8 hours (3 times per day)
+    aster_apr = _calculate_apr(aster_rate_decimal, aster_periods_per_day)
+    lighter_apr = _calculate_apr(lighter_rate_decimal, 3)
 
     long_aster_short_lighter = lighter_apr - aster_apr
     long_lighter_short_aster = aster_apr - lighter_apr
@@ -814,6 +857,7 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
         "available": True,
         "aster_rate": aster_rate_decimal * 100 if aster_rate_decimal is not None else None,
         "aster_apr": aster_apr,
+        "aster_periods_per_day": aster_periods_per_day,
         "lighter_rate": lighter_rate_decimal * 100 if lighter_rate_decimal is not None else None,
         "lighter_apr": lighter_apr,
         "long_exch": long_exch,
@@ -823,7 +867,10 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
         "aster_mid": aster_mid,
         "lighter_mid": lighter_mid,
     }
-    logger.debug(f"fetch_symbol_funding: Success for {symbol}: net_apr={net_apr:.2f}%, long={long_exch}, short={short_exch}")
+    logger.debug(
+        f"fetch_symbol_funding: Success for {symbol}: net_apr={net_apr:.2f}%, long={long_exch}, short={short_exch}, "
+        f"aster_periods={aster_periods_per_day}/day"
+    )
     return result
 
 
@@ -1371,6 +1418,131 @@ async def get_lighter_balance(env: dict) -> Tuple[float, float]:
         raise BalanceFetchError(f"Lighter balance fetch failed: {type(exc).__name__}: {exc}") from exc
 
 
+async def update_capital_status(
+    env: dict,
+    aster: AsterApiManager,
+    state_mgr: 'StateManager',
+    config: BotConfig
+) -> bool:
+    """
+    Fetch balances from both exchanges and update capital_status in state.
+
+    Returns:
+        True if successful, False if any balance fetch failed
+    """
+    try:
+        logger.info("Fetching balances from both exchanges...")
+
+        # Fetch balances from both exchanges
+        aster_total, aster_available = await get_aster_balance(aster)
+        lighter_total, lighter_available = await get_lighter_balance(env)
+
+        # Calculate totals
+        total_capital = aster_total + lighter_total
+        total_available = aster_available + lighter_available
+
+        # Calculate max position notional considering leverage
+        # We need capital on BOTH exchanges, so use the minimum
+        max_per_exchange = min(aster_available, lighter_available)
+
+        # With leverage, the position notional can be larger than available capital
+        # But we still need enough margin on both sides
+        max_position_notional = max_per_exchange * config.leverage
+
+        # Determine limiting exchange
+        limiting_exchange = "Aster" if aster_available <= lighter_available else "Lighter"
+
+        # Store initial capital on first fetch
+        if state_mgr.state["capital_status"]["initial_total_capital"] is None:
+            state_mgr.state["capital_status"]["initial_total_capital"] = total_capital
+
+        # Update capital status
+        state_mgr.state["capital_status"].update({
+            "aster_total": aster_total,
+            "aster_available": aster_available,
+            "lighter_total": lighter_total,
+            "lighter_available": lighter_available,
+            "total_capital": total_capital,
+            "total_available": total_available,
+            "max_position_notional": max_position_notional,
+            "limiting_exchange": limiting_exchange,
+            "last_updated": utc_now_iso()
+        })
+        state_mgr.save()
+
+        # Log capital status with colors
+        logger.info(
+            f"\n{Colors.BOLD}{'═' * 80}\n"
+            f"CAPITAL STATUS\n"
+            f"{'═' * 80}{Colors.RESET}\n"
+            f"  {Colors.CYAN}Aster:{Colors.RESET}   Total: ${aster_total:,.2f} | Available: {Colors.GREEN}${aster_available:,.2f}{Colors.RESET}\n"
+            f"  {Colors.CYAN}Lighter:{Colors.RESET}  Total: ${lighter_total:,.2f} | Available: {Colors.GREEN}${lighter_available:,.2f}{Colors.RESET}\n"
+            f"  {Colors.BOLD}Combined:{Colors.RESET} Total: ${total_capital:,.2f} | Available: {Colors.GREEN}${total_available:,.2f}{Colors.RESET}\n"
+            f"  {Colors.YELLOW}Max Position Notional:{Colors.RESET} ${max_position_notional:,.2f} (limited by {Colors.CYAN}{limiting_exchange}{Colors.RESET})\n"
+            f"  {Colors.YELLOW}Configured Notional:{Colors.RESET} ${config.notional_per_position:,.2f}\n"
+            f"{Colors.BOLD}{'═' * 80}{Colors.RESET}"
+        )
+
+        return True
+
+    except BalanceFetchError as e:
+        logger.error(f"Failed to fetch balances: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error updating capital status: {e}", exc_info=True)
+        return False
+
+
+def calculate_affordable_notional(
+    state_mgr: 'StateManager',
+    config: BotConfig,
+    requested_notional: Optional[float] = None
+) -> Tuple[float, bool]:
+    """
+    Calculate the affordable position notional based on available capital.
+
+    Args:
+        state_mgr: State manager containing capital_status
+        config: Bot configuration
+        requested_notional: Requested notional (defaults to config.notional_per_position)
+
+    Returns:
+        Tuple of (affordable_notional, was_adjusted)
+        - affordable_notional: The actual notional to use for the position
+        - was_adjusted: True if the notional was reduced from requested amount
+    """
+    if requested_notional is None:
+        requested_notional = config.notional_per_position
+
+    capital_status = state_mgr.state.get("capital_status", {})
+    max_position_notional = capital_status.get("max_position_notional", 0.0)
+
+    # Apply safety margin
+    safe_max_notional = max_position_notional * config.capital_safety_margin
+
+    if requested_notional <= safe_max_notional:
+        # We can afford the full requested amount
+        return requested_notional, False
+    else:
+        # Need to reduce to what we can afford
+        affordable = safe_max_notional
+
+        # Log the adjustment
+        limiting_exchange = capital_status.get("limiting_exchange", "Unknown")
+        aster_available = capital_status.get("aster_available", 0.0)
+        lighter_available = capital_status.get("lighter_available", 0.0)
+
+        logger.warning(
+            f"\n{Colors.YELLOW}{Colors.BOLD}⚠️  POSITION SIZE ADJUSTED{Colors.RESET}\n"
+            f"  {Colors.YELLOW}Requested:{Colors.RESET} ${requested_notional:,.2f}\n"
+            f"  {Colors.GREEN}Affordable:{Colors.RESET} ${affordable:,.2f} (with {config.capital_safety_margin*100:.0f}% safety margin)\n"
+            f"  {Colors.CYAN}Limited by:{Colors.RESET} {limiting_exchange} (${aster_available:,.2f} Aster, ${lighter_available:,.2f} Lighter available)\n"
+            f"  {Colors.GRAY}Safety margin reduces max from ${max_position_notional:,.2f} to ${safe_max_notional:,.2f}{Colors.RESET}"
+        )
+
+        return affordable, True
+
+
 def format_price(price: Optional[float]) -> str:
     """
     Format price with appropriate precision based on magnitude.
@@ -1673,6 +1845,12 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                 logger.info("Setting state to IDLE after clearing invalid position")
                 state_mgr.set_state(BotState.IDLE)
 
+    # Fetch initial capital status
+    logger.info("Fetching initial capital status from exchanges...")
+    capital_ok = await update_capital_status(env, aster, state_mgr, config)
+    if not capital_ok:
+        logger.error("Failed to fetch initial capital status. Continuing anyway...")
+
     try:
         while True:
             current_state = state_mgr.get_state()
@@ -1747,6 +1925,30 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
 
                 state_mgr.set_state(BotState.OPENING)
 
+                # Update capital status and validate before opening
+                logger.info("Updating capital status before opening position...")
+                capital_ok = await update_capital_status(env, aster, state_mgr, config)
+
+                if not capital_ok:
+                    logger.error("Failed to fetch current capital status. Skipping this cycle...")
+                    state_mgr.set_state(BotState.WAITING)
+                    await asyncio.sleep(60)
+                    continue
+
+                # Calculate affordable notional with safety margin
+                affordable_notional, was_adjusted = calculate_affordable_notional(state_mgr, config)
+
+                if affordable_notional <= 0:
+                    logger.error(
+                        f"{Colors.RED}{Colors.BOLD}⚠️  INSUFFICIENT CAPITAL{Colors.RESET}\n"
+                        f"  No available capital to open positions. Please deposit funds.\n"
+                        f"  Aster available: ${state_mgr.state['capital_status']['aster_available']:,.2f}\n"
+                        f"  Lighter available: ${state_mgr.state['capital_status']['lighter_available']:,.2f}"
+                    )
+                    state_mgr.set_state(BotState.WAITING)
+                    await asyncio.sleep(300)  # Wait 5 minutes before checking again
+                    continue
+
                 try:
                     metadata = await open_delta_neutral_position(
                         env,
@@ -1755,7 +1957,7 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                         best['long_exch'],
                         best['short_exch'],
                         config.leverage,
-                        config.notional_per_position,
+                        affordable_notional,  # Use affordable notional instead of config value
                         cross_ticks=100
                     )
 
@@ -1768,7 +1970,10 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                         "opened_at": utc_now_iso(),
                         "target_close_at": to_iso_z(utc_now() + timedelta(hours=config.hold_duration_hours)),
                         "metadata": metadata,
-                        "expected_net_apr": best['net_apr']
+                        "expected_net_apr": best['net_apr'],
+                        "actual_notional": affordable_notional,
+                        "requested_notional": config.notional_per_position,
+                        "notional_was_adjusted": was_adjusted
                     }
                     state_mgr.set_state(BotState.HOLDING)
                     logger.info("Position opened successfully, now holding...")
