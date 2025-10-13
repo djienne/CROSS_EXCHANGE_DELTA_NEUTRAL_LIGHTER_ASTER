@@ -1,0 +1,30 @@
+version: '3.8'
+services:
+  lighter-aster-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lighter-aster-hedge-bot
+    restart: unless-stopped
+    # Load environment variables from .env file
+    env_file:
+      - .env
+    # Mount volumes for persistence
+    volumes:
+      # Persist bot state across restarts
+      - ./:/app/
+    # Graceful shutdown handling
+    stop_grace_period: 30s
+    stop_signal: SIGINT
+    # Resource limits (optional but recommended)
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

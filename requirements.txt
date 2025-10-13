@@ -1,0 +1,16 @@
+# Core dependencies
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+asyncio>=3.4.3
+# Ethereum/Web3 dependencies (for Aster)
+web3>=6.0.0
+eth-account>=0.10.0
+eth-abi>=4.0.0
+# Lighter SDK
+git+https://github.com/elliottech/lighter-python.git
+numpy
+# Optional but recommended
+colorama>=0.4.6  # For colored terminal output (if you add it later)
+websockets
+pandas
+scipy
