@@ -273,6 +273,21 @@ class AsterApiManager:
             response.raise_for_status()
             return await response.json()
 
+    async def get_premium_index(self, symbol: str) -> dict:
+        """
+        Get current premium index and funding rate for a symbol.
+
+        Returns dict with keys: symbol, markPrice, indexPrice, lastFundingRate, nextFundingTime
+        This gives the CURRENT/UPCOMING funding rate, not historical.
+        """
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        url = f"{FUTURES_BASE_URL}/fapi/v1/premiumIndex"
+        params = {'symbol': symbol}
+        async with self.session.get(url, params=params) as response:
+            response.raise_for_status()
+            return await response.json()
+
     async def get_spot_book_ticker(self, symbol: str, suppress_errors: bool = False) -> dict:
         """Get spot book ticker for a symbol."""
         return await self._make_spot_request('GET', '/api/v1/ticker/bookTicker', params={'symbol': symbol}, suppress_errors=suppress_errors)

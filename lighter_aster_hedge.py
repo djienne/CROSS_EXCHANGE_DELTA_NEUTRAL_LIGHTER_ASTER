@@ -702,37 +702,77 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
         """
         logger.debug(f"fetch_aster_rate: Starting for {symbol}")
         try:
-            # Fetch 2 records to detect funding interval
-            history = await aster.get_funding_rate_history(symbol, limit=2)
-            if not history or len(history) == 0:
-                logger.warning(f"fetch_aster_rate: No funding history for {symbol}")
-                return None
+            # First, try to get current funding rate from premium index (more accurate)
+            try:
+                premium_data = await aster.get_premium_index(symbol)
+                current_rate = float(premium_data.get('lastFundingRate', 0))
+                next_funding_time = int(premium_data.get('nextFundingTime', 0))
 
-            rate = float(history[0].get('fundingRate', 0))
-            logger.debug(f"fetch_aster_rate: Got rate {rate} for {symbol}")
+                logger.debug(
+                    f"fetch_aster_rate: Got CURRENT rate {current_rate} for {symbol} "
+                    f"from premium index (next funding: {next_funding_time})"
+                )
 
-            # Detect funding interval from timestamps
-            periods_per_day = 6  # Default: every 4 hours
-            if len(history) >= 2:
-                try:
-                    time1 = int(history[0].get('fundingTime', 0))
-                    time2 = int(history[1].get('fundingTime', 0))
+                # Fetch history to detect interval
+                history = await aster.get_funding_rate_history(symbol, limit=2)
+                periods_per_day = 6  # Default: every 4 hours
 
-                    if time1 and time2:
-                        interval_ms = abs(time1 - time2)
-                        interval_hours = interval_ms / (1000 * 60 * 60)
+                if history and len(history) >= 2:
+                    try:
+                        time1 = int(history[0].get('fundingTime', 0))
+                        time2 = int(history[1].get('fundingTime', 0))
 
-                        # Calculate periods per day based on interval
-                        if interval_hours > 0:
-                            periods_per_day = round(24 / interval_hours)
-                            logger.debug(
-                                f"fetch_aster_rate: Detected {interval_hours:.1f}h funding interval "
-                                f"for {symbol} ({periods_per_day} periods/day)"
-                            )
-                except Exception as e:
-                    logger.debug(f"fetch_aster_rate: Could not detect interval for {symbol}, using default: {e}")
+                        if time1 and time2:
+                            interval_ms = abs(time1 - time2)
+                            interval_hours = interval_ms / (1000 * 60 * 60)
 
-            return (rate, periods_per_day)
+                            # Calculate periods per day based on interval
+                            if interval_hours > 0:
+                                periods_per_day = round(24 / interval_hours)
+                                logger.debug(
+                                    f"fetch_aster_rate: Detected {interval_hours:.1f}h funding interval "
+                                    f"for {symbol} ({periods_per_day} periods/day)"
+                                )
+                    except Exception as e:
+                        logger.debug(f"fetch_aster_rate: Could not detect interval for {symbol}, using default: {e}")
+
+                return (current_rate, periods_per_day)
+
+            except Exception as premium_err:
+                # Fallback to history if premium index fails
+                logger.debug(f"fetch_aster_rate: Premium index failed for {symbol}, falling back to history: {premium_err}")
+
+                history = await aster.get_funding_rate_history(symbol, limit=2)
+                if not history or len(history) == 0:
+                    logger.warning(f"fetch_aster_rate: No funding history for {symbol}")
+                    return None
+
+                rate = float(history[0].get('fundingRate', 0))
+                logger.debug(f"fetch_aster_rate: Got rate {rate} for {symbol} from history")
+
+                # Detect funding interval from timestamps
+                periods_per_day = 6  # Default: every 4 hours
+                if len(history) >= 2:
+                    try:
+                        time1 = int(history[0].get('fundingTime', 0))
+                        time2 = int(history[1].get('fundingTime', 0))
+
+                        if time1 and time2:
+                            interval_ms = abs(time1 - time2)
+                            interval_hours = interval_ms / (1000 * 60 * 60)
+
+                            # Calculate periods per day based on interval
+                            if interval_hours > 0:
+                                periods_per_day = round(24 / interval_hours)
+                                logger.debug(
+                                    f"fetch_aster_rate: Detected {interval_hours:.1f}h funding interval "
+                                    f"for {symbol} ({periods_per_day} periods/day)"
+                                )
+                    except Exception as e:
+                        logger.debug(f"fetch_aster_rate: Could not detect interval for {symbol}, using default: {e}")
+
+                return (rate, periods_per_day)
+
         except Exception as exc:
             logger.error("Error fetching Aster funding for %s: %s", symbol, exc, exc_info=True)
             return None

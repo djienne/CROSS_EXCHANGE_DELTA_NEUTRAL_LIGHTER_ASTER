@@ -11,7 +11,6 @@
     "XRP",
     "LINK",
     "LTC",
-    "ASTER",
     "XPL",
     "FARTCOIN",
     "PUMP"
@@ -35,5 +34,7 @@
   "comment_stop_loss": "Enable automatic stop-loss based on leverage",
   "enable_stop_loss": true,
   "comment_funding_refresh": "Minutes between funding rate table refreshes while holding position",
-  "funding_table_refresh_minutes": 5.0
+  "funding_table_refresh_minutes": 5.0,
+  "comment_capital_safety": "Capital safety margin (0.95 = use 95% of available capital, keeping 5% buffer for fees/slippage)",
+  "capital_safety_margin": 0.95
 }
