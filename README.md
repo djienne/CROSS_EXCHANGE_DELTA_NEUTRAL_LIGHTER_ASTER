@@ -1,6 +1,6 @@
 # Lighter-Aster Cross-Exchange Delta Neutral Strategy
 
-Automated delta-neutral position rotation bot between **Lighter perpetual** and **Aster perpetual** markets.
+Delta-neutral strategy across LIGHTER and ASTER cryptocurrency perpetual futures exchanges. Captures funding rate while maintaining market-neutral exposure and generating volume with forced position refresh at regular intervals.
 
 ## Overview
 
@@ -625,3 +625,4 @@ For issues or questions:
 ---
 
 **Disclaimer**: This bot is for educational and informational purposes only. It is not financial advice. Cryptocurrency trading carries significant risk. Always do your own research and consult with a financial advisor.
+
