@@ -8,7 +8,7 @@ This bot implements a cross-exchange delta-neutral trading strategy that:
 
 1. **Analyzes funding rates** across multiple symbols on both Lighter and Aster
 2. **Opens delta-neutral positions** (long on one exchange, short on the other)
-3. **Holds positions** for 8 hours to collect funding payments
+3. **Holds positions** for 8 hours to collect funding payments (configurable)
 4. **Closes positions** and realizes PnL
 5. **Repeats the cycle** automatically
 
@@ -629,3 +629,4 @@ For issues or questions:
 ---
 
 **Disclaimer**: This bot is for educational and informational purposes only. It is not financial advice. Cryptocurrency trading carries significant risk. Always do your own research and consult with a financial advisor.
+
