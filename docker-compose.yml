@@ -1,4 +1,10 @@
 version: '3.8'
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.58.96.0/22
 services:
   lighter-aster-bot:
     build:
@@ -9,6 +15,8 @@ services:
     # Load environment variables from .env file
     env_file:
       - .env
+    environment:
+      - PYTHONUNBUFFERED=1
     # Mount volumes for persistence
     volumes:
       # Persist bot state across restarts

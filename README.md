@@ -138,17 +138,21 @@ cp .env.example .env
 
 **Configure credentials in `.env`**:
 
-   **For Aster**:
+   **For Lighter** (Required):
+   - `API_KEY_PRIVATE_KEY` - Your Lighter private key
+   - `ACCOUNT_INDEX` - Lighter account index (usually 0)
+   - `API_KEY_INDEX` - Lighter API key index (usually 0)
+
+   **For Lighter** (Optional):
+   - `LIGHTER_BASE_URL` - Lighter API endpoint (default: `https://mainnet.zklighter.elliot.ai`)
+   - `LIGHTER_WS_URL` - Lighter WebSocket endpoint (default: `wss://mainnet.zklighter.elliot.ai/stream`)
+
+   **For Aster** (Required):
    - `ASTER_API_USER` - Your Ethereum wallet address
    - `ASTER_API_SIGNER` - Authorized signer address
    - `ASTER_API_PRIVATE_KEY` - Private key for signing
    - `ASTER_APIV1_PUBLIC` - API public key
    - `ASTER_APIV1_PRIVATE` - API private key
-
-   **For Lighter**:
-   - `API_KEY_PRIVATE_KEY` - Your Lighter private key
-   - `ACCOUNT_INDEX` - Lighter account index (usually 0)
-   - `API_KEY_INDEX` - Lighter API key index (usually 0)
 
 ### Step 5: Review Configuration (Optional)
 
