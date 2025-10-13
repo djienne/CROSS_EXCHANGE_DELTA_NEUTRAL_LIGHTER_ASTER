@@ -151,24 +151,24 @@ cp .env.example .env
 
    **For Aster** (Required):
 
-   Aster requires **two separate APIs** to be configured:
+   Aster requires **two separate API configurations** for perpetual trading:
 
-   #### 1️⃣ Spot API (for API Key/Secret)
+   #### 1️⃣ API Tab (API Key/Secret Credentials)
 
    Go to **More > API Management** in the Aster UI:
 
    ![Where to find API Management](where_is_API_mangement.png)
 
-   Then select **API** tab and create your Spot API credentials:
+   Then select **API** tab and create your API credentials:
 
    ![Spot API Creation](infos_API_p1.png)
 
-   - `ASTER_APIV1_PUBLIC` - Your Spot API public key (shown as "API key")
-   - `ASTER_APIV1_PRIVATE` - Your Spot API secret key (shown as "API secret key")
+   - `ASTER_APIV1_PUBLIC` - Your API public key (shown as "API key")
+   - `ASTER_APIV1_PRIVATE` - Your API secret key (shown as "API secret key")
 
    **⚠️ Important**: The API secret key is only shown once! Save it immediately.
 
-   #### 2️⃣ Pro API (for Perpetual Trading)
+   #### 2️⃣ Pro API Tab (Authorized Wallet for Trading)
 
    Go to the **Pro API** tab and authorize an API wallet:
 
@@ -179,6 +179,8 @@ cp .env.example .env
    - `ASTER_API_PRIVATE_KEY` - The private key of the API wallet (save when you click "Generate")
 
    **⚠️ Important**: The generated private key won't be shown again after authorization!
+
+   **📌 Note**: Both API configurations are required for the bot to trade perpetuals on Aster. The API credentials authenticate your requests, while the Pro API wallet executes trades.
 
 ### Step 5: ⚙️ Review Configuration (Optional)
 
