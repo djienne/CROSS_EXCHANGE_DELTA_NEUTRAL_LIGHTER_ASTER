@@ -2,16 +2,16 @@
 
 Delta-neutral strategy across LIGHTER and ASTER cryptocurrency perpetual futures exchanges. Captures funding rate while maintaining market-neutral exposure and generating volume with forced position refresh at regular intervals.
 
-## Overview
+## 📊 Overview
 
 This bot implements a cross-exchange delta-neutral trading strategy that:
 
-1. **Analyzes funding rates** across multiple symbols on both Lighter and Aster
-2. **Opens delta-neutral positions** (long on one exchange, short on the other)
-3. **Holds positions** for 8 hours to collect funding payments (configurable)
-4. **Closes positions** and realizes PnL
-5. **Repeats the cycle** automatically
-6. Use long (> 1 week) hold position time to do fundings rate farming, use short (< 1 day) hold position time to farm volume at low risk.
+1. 📈 **Analyzes funding rates** across multiple symbols on both Lighter and Aster
+2. 🔄 **Opens delta-neutral positions** (long on one exchange, short on the other)
+3. ⏱️ **Holds positions** for 8 hours to collect funding payments (configurable)
+4. 💰 **Closes positions** and realizes PnL
+5. 🔁 **Repeats the cycle** automatically
+6. 💡 Use long (> 1 week) hold position time to do fundings rate farming, use short (< 1 day) hold position time to farm volume at low risk.
 
 ---
 
@@ -25,20 +25,20 @@ This bot implements a cross-exchange delta-neutral trading strategy that:
 - ✅ **Delta-neutral** - Market-neutral exposure by going long and short simultaneously
 - ✅ **Funding rate arbitrage** - Profits from funding rate differences between exchanges
 - ✅ **Persistent state** - Recovers from crashes and restarts with automatic position reconciliation
-- ✅ **PnL tracking** - Real-time unrealized PnL monitoring with percentage display per exchange (always active)
+- ✅ **PnL tracking** - Real-time unrealized PnL monitoring: worst-leg PnL per exchange and total combined PnL with percentages (always active)
 - ✅ **Stop-loss execution** - Automatic position closure when worst-leg PnL exceeds threshold (75% of liquidation threshold)
 - ✅ **Rate limiting** - Built-in retry logic with exponential backoff
 - ✅ **Color-coded output** - Easy-to-read terminal output with status colors
 - ✅ **Emergency exit** - Standalone script for immediate position closure
-- ⚠️ **Health monitoring flag** - Not implemented (planned feature, flag has no effect)
+- ✅ **Hot-reload config** - Update configuration without restarting the bot
 - ⚠️ **Advanced statistics** - Cycle counters work, but detailed PnL/volume stats not populated
 
-## Strategy Logic
+## 🧠 Strategy Logic
 
 The bot follows this flow (adapted from `lighter_edgex_hedge.py`):
 
 1. **Funding Rate Analysis**
-   - Fetches funding rates from both Lighter (3x/day) and Aster (6x/day)
+   - Fetches funding rates from both Lighter (24x/day) and Aster (3x/day)
    - Calculates annualized APR for each exchange
    - Determines optimal hedge direction (long vs short on each exchange)
    - Filters by minimum APR threshold and spread constraints
@@ -56,6 +56,7 @@ The bot follows this flow (adapted from `lighter_edgex_hedge.py`):
    - Monitors position health every 60 seconds (configurable)
    - Tracks unrealized PnL on both exchanges in real-time
    - Displays worst-leg PnL (most negative) with percentage and exchange name
+   - Displays total combined PnL (Lighter + Aster) with percentage
    - Shows stop-loss threshold based on leverage
    - **Executes stop-loss** - Closes position early if worst-leg PnL exceeds threshold
    - Refreshes funding rate table every 5 minutes (configurable)
@@ -73,7 +74,7 @@ The bot follows this flow (adapted from `lighter_edgex_hedge.py`):
    - Waits for configured delay (default: 5 minutes)
    - Returns to analysis phase
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 lighter_aster_hedge.py       # Main strategy file
@@ -92,18 +93,18 @@ README.md                    # This file
 EMERGENCY_EXIT_README.md     # Emergency exit documentation
 ```
 
-## Prerequisites
+## ✅ Prerequisites
 
 - Python 3.8+
 - Active accounts on both Lighter and Aster exchanges
 - API credentials for both exchanges
 - Sufficient capital (recommended: $500+ for meaningful positions)
 
-## Installation
+## 🔧 Installation
 
-### Step 1: Copy Required Connector Files
+### Step 1: 📋 Copy Required Connector Files
 
-**IMPORTANT**: The strategy uses two exchange connectors that must be copied from source projects:
+**⚠️ IMPORTANT**: The strategy uses two exchange connectors that must be copied from source projects:
 
 1. **Copy `lighter_client.py`** from `CROSS_EXCHANGE_DELTA_NEUTRAL_LIGHTER_EDGEX-main/`
    ```bash
@@ -117,7 +118,7 @@ EMERGENCY_EXIT_README.md     # Emergency exit documentation
 
 **Note**: `utils.py` and `strategy_logic.py` are already included in this project as required dependencies for `aster_api_manager.py`.
 
-### Step 2: Install Python Dependencies
+### Step 2: 📦 Install Python Dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -128,14 +129,14 @@ Or install manually:
 pip install python-dotenv aiohttp web3 eth-account eth-abi lighter-python
 ```
 
-### Step 3: Configure Environment
+### Step 3: 🔐 Configure Environment
 
 ```bash
 cp .env.example .env
 # Edit .env with your credentials (see below)
 ```
 
-### Step 4: Configure Credentials
+### Step 4: 🔑 Configure Credentials
 
 **Configure credentials in `.env`**:
 
@@ -149,13 +150,37 @@ cp .env.example .env
    - `LIGHTER_WS_URL` - Lighter WebSocket endpoint (default: `wss://mainnet.zklighter.elliot.ai/stream`)
 
    **For Aster** (Required):
-   - `ASTER_API_USER` - Your Ethereum wallet address
-   - `ASTER_API_SIGNER` - Authorized signer address
-   - `ASTER_API_PRIVATE_KEY` - Private key for signing
-   - `ASTER_APIV1_PUBLIC` - API public key
-   - `ASTER_APIV1_PRIVATE` - API private key
 
-### Step 5: Review Configuration (Optional)
+   Aster requires **two separate APIs** to be configured:
+
+   #### 1️⃣ Spot API (for API Key/Secret)
+
+   Go to **More > API Management** in the Aster UI:
+
+   ![Where to find API Management](where_is_API_mangement.png)
+
+   Then select **API** tab and create your Spot API credentials:
+
+   ![Spot API Creation](infos_API_p1.png)
+
+   - `ASTER_APIV1_PUBLIC` - Your Spot API public key (shown as "API key")
+   - `ASTER_APIV1_PRIVATE` - Your Spot API secret key (shown as "API secret key")
+
+   **⚠️ Important**: The API secret key is only shown once! Save it immediately.
+
+   #### 2️⃣ Pro API (for Perpetual Trading)
+
+   Go to the **Pro API** tab and authorize an API wallet:
+
+   ![Pro API Authorization](infos_API_p2.png)
+
+   - `ASTER_API_USER` - Your main Ethereum wallet address (MetaMask, Rabby, etc.)
+   - `ASTER_API_SIGNER` - The authorized API wallet address (shown as "API wallet address")
+   - `ASTER_API_PRIVATE_KEY` - The private key of the API wallet (save when you click "Generate")
+
+   **⚠️ Important**: The generated private key won't be shown again after authorization!
+
+### Step 5: ⚙️ Review Configuration (Optional)
 
 **Review and customize `config.json`**:
    - `symbols_to_monitor` - List of symbols to analyze
@@ -165,7 +190,7 @@ cp .env.example .env
    - `min_net_apr_threshold` - Minimum APR to open positions
    - Other parameters (see Configuration section below)
 
-## Configuration
+## ⚙️ Configuration
 
 Edit `config.json` to customize bot behavior:
 
@@ -181,11 +206,35 @@ Edit `config.json` to customize bot behavior:
   "min_net_apr_threshold": 5.0,
   "max_spread_pct": 0.15,
   "enable_stop_loss": true,              // ✅ FUNCTIONAL - Closes position early if threshold breached
-  "enable_pnl_tracking": true,           // ⚠️ NON-FUNCTIONAL - PnL always tracked regardless
-  "enable_health_monitoring": true,      // ⚠️ NOT IMPLEMENTED - Planned feature
   "funding_table_refresh_minutes": 5.0
 }
 ```
+
+### Hot-Reloading Configuration
+
+**🔥 The bot supports hot-reloading of configuration without restart!**
+
+The configuration file is automatically reloaded before opening each new position. This means:
+- ✅ **No restart required** - Modify `config.json` while the bot is running
+- ✅ **Safe updates** - Changes only apply to new positions (after current position closes)
+- ✅ **Change tracking** - Bot logs all parameter changes when config is reloaded
+
+**Example workflow:**
+1. Bot is holding a position with leverage 1x, notional $100
+2. You edit `config.json` to set leverage 2x, notional $200
+3. Bot logs: "Configuration reloaded with changes: leverage: 1 → 2, notional_per_position: 100.0 → 200.0"
+4. Current position continues with old settings (1x, $100)
+5. Next position uses new settings (2x, $200)
+
+**What you can hot-reload:**
+- `symbols_to_monitor` - Add or remove symbols
+- `leverage` - Change leverage multiplier
+- `notional_per_position` - Adjust position size
+- `min_net_apr_threshold` - Modify APR filter
+- `max_spread_pct` - Adjust spread tolerance
+- `enable_stop_loss` - Enable/disable stop-loss
+- `funding_table_refresh_minutes` - Change refresh interval
+- All other config parameters
 
 ### Parameter Reference
 
@@ -195,19 +244,17 @@ Edit `config.json` to customize bot behavior:
 | `quote` | string | `"USDT"` | Quote currency |
 | `leverage` | int | `3` | Leverage multiplier (1-5x recommended) |
 | `notional_per_position` | float | `100.0` | Position size in USD |
-| `hold_duration_hours` | float | `8.0` | Hold duration (8h = 1 Lighter funding cycle) |
+| `hold_duration_hours` | float | `8.0` | Hold duration (8h = 1 Aster funding cycle, 8 Lighter payments) |
 | `wait_between_cycles_minutes` | float | `5.0` | Wait time between cycles |
 | `check_interval_seconds` | int | `60` | Position health check interval |
 | `min_net_apr_threshold` | float | `5.0` | Minimum net APR to open position (%) |
 | `max_spread_pct` | float | `0.15` | Maximum cross-exchange spread (%) |
 | `enable_stop_loss` | bool | `true` | Enable automatic stop-loss execution (closes position early if threshold breached) |
-| `enable_pnl_tracking` | bool | `true` | ⚠️ **Non-functional** - PnL tracking is always active regardless of this setting |
-| `enable_health_monitoring` | bool | `true` | ⚠️ **Not implemented** - Planned feature, currently has no effect |
 | `funding_table_refresh_minutes` | float | `5.0` | Funding rate table refresh interval during hold |
 
-## Usage
+## 🚀 Usage
 
-### Run the bot
+### 🏃 Run the bot
 
 ```bash
 python lighter_aster_hedge.py
@@ -225,14 +272,14 @@ python lighter_aster_hedge.py --config my_config.json
 python lighter_aster_hedge.py --state-file my_state.json
 ```
 
-### Stop the bot
+### 🛑 Stop the bot
 
 Press `Ctrl+C` for graceful shutdown. The bot will:
 - Save current state
 - NOT close open positions (manual closure required)
 - Exit cleanly
 
-### Emergency Exit
+### 🚨 Emergency Exit
 
 For immediate position closure in emergency situations, use the standalone emergency exit script:
 
@@ -257,7 +304,7 @@ python emergency_exit.py
 
 **See [EMERGENCY_EXIT_README.md](EMERGENCY_EXIT_README.md) for detailed documentation.**
 
-## State Management
+## 💾 State Management
 
 The bot maintains persistent state in `bot_state.json`:
 
@@ -269,7 +316,7 @@ The bot maintains persistent state in `bot_state.json`:
   - ✅ **Working**: `total_cycles`, `successful_cycles`, `failed_cycles`, `last_error`, `last_error_at`
   - ⚠️ **Not populated**: `total_realized_pnl`, `total_trading_pnl`, `total_funding_pnl`, `total_fees_paid`, `best_cycle_pnl`, `worst_cycle_pnl`, `total_volume_traded`, `total_hold_time_hours`, `by_symbol` (planned features)
 
-### Recovery After Crash
+### 🔄 Recovery After Crash
 
 If the bot crashes or is stopped, it will:
 1. Load state from `bot_state.json` on restart
@@ -287,15 +334,15 @@ If the bot crashes or is stopped, it will:
 
 **Note**: The bot does NOT automatically detect positions opened outside the bot. Only positions tracked in `bot_state.json` are monitored.
 
-## Monitoring
+## 👀 Monitoring
 
-### Console Output
+### 🖥️ Console Output
 
 The bot displays color-coded real-time information:
 
 - **Funding rate analysis table** - APR for each symbol with spread filtering
 - **Position opening progress** - Order placement status (green=success, red=error)
-- **Position holding updates** - Time remaining, stop-loss %, worst PnL with exchange
+- **Position holding updates** - Time remaining, stop-loss %, worst PnL with exchange, total combined PnL
 - **Position closing progress** - Closure verification with color indicators
 
 **Color Coding:**
@@ -307,23 +354,23 @@ The bot displays color-coded real-time information:
 
 **Enhanced Holding Display:**
 ```
-Holding position for BTCUSDT - 7.60 hours remaining | Stop-loss: 25.00% | Worst PnL: $-1.76 (-0.9% on Aster)
+Holding position for BTCUSDT - 7.60 hours remaining | Stop-loss: 25.00% | Worst PnL: $-1.76 (-0.9% on Aster) | Total PnL: $+0.43 (+0.2%)
 ```
 - Shows calculated stop-loss threshold (75% of liquidation level)
-- Displays worst-leg unrealized PnL in dollars
-- Shows PnL as percentage of position value
-- Identifies which exchange has the worst PnL
+- Displays worst-leg unrealized PnL in dollars and percentage
+- Identifies which exchange has the worst PnL (used for stop-loss calculation)
+- Shows total combined PnL (Lighter + Aster) in dollars and percentage (actual performance)
 
-### Log Files
+### 📝 Log Files
 
 Detailed logs are saved to `logs/lighter_aster_hedge.log`:
 
 - **INFO level**: Console messages
 - **DEBUG level**: Detailed API calls, calculations, state changes
 
-## Risk Management
+## 🛡️ Risk Management
 
-### Stop-Loss
+### 🚫 Stop-Loss
 
 When enabled (`enable_stop_loss: true`), the bot automatically calculates and **executes** stop-loss based on leverage:
 
@@ -349,17 +396,17 @@ Closing position early due to stop-loss...
 
 This protects against liquidation while accounting for normal market volatility.
 
-### Position Limits
+### 📏 Position Limits
 
 - **Minimum position**: $10 USD equivalent
 - **Maximum position**: Limited by available capital * leverage
 - **Capital check**: Bot verifies sufficient capital before opening
 
-### Spread Filtering
+### 📐 Spread Filtering
 
 Positions are only opened when cross-exchange spread is below `max_spread_pct` (default: 0.15%). This prevents opening positions when markets are misaligned.
 
-## Connectors (DO NOT EDIT)
+## 🔌 Connectors (DO NOT EDIT)
 
 The bot uses two connector modules that should **NOT be edited**:
 
@@ -386,17 +433,17 @@ Provides methods for Aster exchange:
 - `get_perp_leverage()` / `set_perp_leverage()` - Manage leverage
 - `get_perp_symbol_filter()` - Get precision filters
 
-## Funding Rate Mechanics
+## 💰 Funding Rate Mechanics
 
 ### Lighter
+- **Frequency**: Every 1 hour (24x per day)
+- **Times**: Every hour UTC (00:00, 01:00, 02:00, ...)
+- **APR calculation**: `rate * 24 * 365 * 100`
+
+### Aster
 - **Frequency**: Every 8 hours (3x per day)
 - **Times**: 00:00, 08:00, 16:00 UTC
 - **APR calculation**: `rate * 3 * 365 * 100`
-
-### Aster
-- **Frequency**: Every 4 hours (6x per day)
-- **Times**: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
-- **APR calculation**: `rate * 6 * 365 * 100`
 
 ### Net APR
 
@@ -410,7 +457,7 @@ If Long Lighter + Short Aster:
   Net APR = Aster APR - Lighter APR
 ```
 
-## Example Run
+## 📸 Example Run
 
 ```
 2025-10-13 10:00:00 - Starting Lighter-Aster Delta Neutral Hedge Bot...
@@ -452,9 +499,9 @@ Verifying positions...
   Delta-neutral: LONG Aster, SHORT Lighter
 
 2025-10-13 10:00:10 - Position opened successfully, now holding...
-2025-10-13 11:00:10 - Holding position for LTCUSDT - 7.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-1.23 (-0.6% on Lighter)
-2025-10-13 12:00:10 - Holding position for LTCUSDT - 6.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $+0.58 (+0.3% on Lighter)
-2025-10-13 13:00:10 - Holding position for LTCUSDT - 5.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-0.34 (-0.2% on Aster)
+2025-10-13 11:00:10 - Holding position for LTCUSDT - 7.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-1.23 (-0.6% on Lighter) | Total PnL: $+0.45 (+0.2%)
+2025-10-13 12:00:10 - Holding position for LTCUSDT - 6.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $+0.58 (+0.3% on Lighter) | Total PnL: $+1.82 (+0.9%)
+2025-10-13 13:00:10 - Holding position for LTCUSDT - 5.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-0.34 (-0.2% on Aster) | Total PnL: $+0.98 (+0.5%)
 
 [Refreshing funding rate table every 5 minutes...]
 
@@ -488,9 +535,9 @@ Verifying closure...
 
 ```
 2025-10-13 10:00:10 - Position opened successfully, now holding...
-2025-10-13 11:00:10 - Holding position for BTCUSDT - 7.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-12.34 (-6.2% on Lighter)
-2025-10-13 12:00:10 - Holding position for BTCUSDT - 6.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-38.50 (-19.3% on Lighter)
-2025-10-13 12:30:10 - Holding position for BTCUSDT - 5.50 hours remaining | Stop-loss: 25.00% | Worst PnL: $-52.75 (-26.4% on Lighter)
+2025-10-13 11:00:10 - Holding position for BTCUSDT - 7.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-12.34 (-6.2% on Lighter) | Total PnL: $-8.50 (-4.3%)
+2025-10-13 12:00:10 - Holding position for BTCUSDT - 6.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-38.50 (-19.3% on Lighter) | Total PnL: $-32.10 (-16.1%)
+2025-10-13 12:30:10 - Holding position for BTCUSDT - 5.50 hours remaining | Stop-loss: 25.00% | Worst PnL: $-52.75 (-26.4% on Lighter) | Total PnL: $-45.20 (-22.6%)
 
 ⚠️  STOP-LOSS TRIGGERED! Worst PnL: -26.4% >= 25.00% threshold on Lighter
 Closing position early due to stop-loss...
@@ -519,7 +566,7 @@ Verifying closure...
 
 **Note**: Output is color-coded in the terminal (green for success, red for errors, yellow for warnings, cyan for status messages).
 
-## Real Console Output
+## 🖼️ Real Console Output
 
 Here's an actual screenshot of the bot running with position recovery and live monitoring:
 
@@ -528,7 +575,7 @@ Here's an actual screenshot of the bot running with position recovery and live m
 **What you see in this screenshot:**
 1. **Position Recovery** - Bot automatically detected and resumed monitoring an existing LTCUSDT position after restart
 2. **Position Verification** - Confirmed delta-neutral positions on both exchanges (Aster: +2.062000 LTC, Lighter: -2.062000 LTC)
-3. **Real-time Monitoring** - Live PnL tracking showing worst-leg PnL of -$3.02 (-1.5% on Lighter) with 75.00% stop-loss threshold (1x leverage)
+3. **Real-time Monitoring** - Live PnL tracking showing worst-leg PnL and total combined PnL with 75.00% stop-loss threshold (1x leverage)
 4. **Funding Rate Table** - Periodic refresh (every 5 minutes) showing available opportunities with Net APR rankings
 5. **Current Position Highlighted** - LTCUSDT marked with arrow (→) showing 53.48% Net APR
 6. **Color-coded Display** - Cyan for status messages, yellow for positions, green for success indicators
@@ -536,7 +583,7 @@ Here's an actual screenshot of the bot running with position recovery and live m
 
 This demonstrates the bot's key features in action: persistent state management, automatic recovery, real-time PnL monitoring with stop-loss protection, and continuous funding rate analysis.
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
 ### "No symbols available on both exchanges"
 
@@ -559,7 +606,7 @@ This demonstrates the bot's key features in action: persistent state management,
 ### "Rate limit exceeded"
 
 - The bot has built-in retry logic with exponential backoff
-- If persistent, increase `stagger_delay` in code (line 1907)
+- If persistent, increase `stagger_delay` in code (line 1716)
 - Reduce number of `symbols_to_monitor`
 
 ### "Failed to close position"
@@ -568,18 +615,14 @@ This demonstrates the bot's key features in action: persistent state management,
 - Verify sufficient liquidity in order books
 - May need to manually close positions if bot cannot
 
-## Known Limitations
+## ⚠️ Known Limitations
 
 ### Recently Fixed (2025-10-13)
 - ✅ **Stop-loss execution** - Stop-loss was previously calculated and displayed but never executed. This has been fixed and now properly closes positions early when threshold is breached.
 
 ### Current Limitations
 
-1. **Health Monitoring** - The `enable_health_monitoring` configuration flag exists but has no implementation. This is a planned feature.
-
-2. **PnL Tracking Flag** - The `enable_pnl_tracking` flag is non-functional. PnL tracking is always active and cannot be disabled. The flag will be removed or properly implemented in a future update.
-
-3. **Statistics Tracking** - While basic cycle counters work (total/successful/failed cycles), the following statistics are defined but not populated:
+1. **Statistics Tracking** - While basic cycle counters work (total/successful/failed cycles), the following statistics are defined but not populated:
    - Total realized PnL, trading PnL, funding PnL
    - Total fees paid
    - Best/worst cycle PnL
@@ -587,17 +630,16 @@ This demonstrates the bot's key features in action: persistent state management,
    - Total hold time hours
    - Per-symbol breakdowns
 
-4. **Capital Status** - The capital status fields in state are defined but not currently populated with exchange balance data.
+2. **Capital Status** - The capital status fields in state are defined but not currently populated with exchange balance data.
 
 ### Planned Features
 
 These features are documented in the codebase but not yet implemented:
-- Advanced health monitoring during position holds
 - Detailed PnL breakdown and statistics tracking
 - Balance monitoring and capital allocation
 - Per-symbol performance analytics
 
-## Safety Warnings
+## ⚠️ Safety Warnings
 
 ⚠️ **IMPORTANT DISCLAIMERS**:
 
@@ -615,11 +657,11 @@ These features are documented in the codebase but not yet implemented:
 - Understand the risks before running
 - Never invest more than you can afford to lose
 
-## License
+## 📜 License
 
 This project is provided as-is for educational purposes. Use at your own risk.
 
-## Support
+## 💬 Support
 
 For issues or questions:
 1. Check the troubleshooting section

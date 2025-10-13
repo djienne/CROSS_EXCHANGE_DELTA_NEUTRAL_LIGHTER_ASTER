@@ -236,8 +236,6 @@ class BotConfig:
     min_net_apr_threshold: float = 5.0
     max_spread_pct: float = 0.15
     enable_stop_loss: bool = True
-    enable_pnl_tracking: bool = True
-    enable_health_monitoring: bool = True
     funding_table_refresh_minutes: float = 5.0
 
     @staticmethod
@@ -262,8 +260,6 @@ class BotConfig:
                 'min_net_apr_threshold': 5.0,
                 'max_spread_pct': 0.15,
                 'enable_stop_loss': True,
-                'enable_pnl_tracking': True,
-                'enable_health_monitoring': True,
                 'funding_table_refresh_minutes': 5.0
             }
 
@@ -279,6 +275,60 @@ class BotConfig:
         except Exception as e:
             logger.error(f"Error loading config: {e}")
             return BotConfig(symbols_to_monitor=DEFAULT_SYMBOLS)
+
+    def reload(self, config_file: str) -> bool:
+        """
+        Reload configuration from file, updating this instance.
+        Returns True if reload was successful, False otherwise.
+        """
+        try:
+            with open(config_file, 'r') as f:
+                data = json.load(f)
+
+            # Remove comment fields
+            data = {k: v for k, v in data.items() if not k.startswith('comment')}
+
+            # Provide defaults
+            defaults = {
+                'symbols_to_monitor': DEFAULT_SYMBOLS,
+                'quote': 'USDT',
+                'leverage': 3,
+                'notional_per_position': 100.0,
+                'hold_duration_hours': 8.0,
+                'wait_between_cycles_minutes': 5.0,
+                'check_interval_seconds': 60,
+                'min_net_apr_threshold': 5.0,
+                'max_spread_pct': 0.15,
+                'enable_stop_loss': True,
+                'funding_table_refresh_minutes': 5.0
+            }
+
+            for key, default_value in defaults.items():
+                if key not in data:
+                    data[key] = default_value
+
+            # Update instance attributes
+            changed_params = []
+            for key, new_value in data.items():
+                old_value = getattr(self, key, None)
+                if old_value != new_value:
+                    setattr(self, key, new_value)
+                    changed_params.append(f"{key}: {old_value} → {new_value}")
+
+            if changed_params:
+                logger.info(f"Configuration reloaded with changes:")
+                for change in changed_params:
+                    logger.info(f"  - {change}")
+            else:
+                logger.debug("Configuration reloaded (no changes detected)")
+
+            return True
+        except FileNotFoundError:
+            logger.warning(f"Config file {config_file} not found during reload")
+            return False
+        except Exception as e:
+            logger.error(f"Error reloading config: {e}")
+            return False
 
 
 # ==================== Helper Functions ====================
@@ -742,10 +792,10 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
             "lighter_rate": lighter_rate_decimal * 100 if lighter_rate_decimal is not None else None,
         }
 
-    # Aster funding happens every 4 hours (6 times per day)
-    # Lighter funding happens every 8 hours (3 times per day)
-    aster_apr = _calculate_apr(aster_rate_decimal, 6)
-    lighter_apr = _calculate_apr(lighter_rate_decimal, 3)
+    # Aster funding happens every 8 hours (3 times per day)
+    # Lighter funding happens every 1 hour (24 times per day)
+    aster_apr = _calculate_apr(aster_rate_decimal, 3)
+    lighter_apr = _calculate_apr(lighter_rate_decimal, 24)
 
     long_aster_short_lighter = lighter_apr - aster_apr
     long_lighter_short_aster = aster_apr - lighter_apr
@@ -1595,7 +1645,7 @@ async def fetch_and_display_funding_rates(env: dict, aster: AsterApiManager, con
 
 # ==================== Main Bot Logic ====================
 
-async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig):
+async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, config_file: str):
     """Main bot loop."""
 
     # Initialize Aster API manager
@@ -1628,8 +1678,12 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig):
             current_state = state_mgr.get_state()
 
             if current_state == BotState.IDLE or current_state == BotState.WAITING:
+                # Reload configuration before starting new cycle
+                logger.info("Starting new cycle - reloading configuration...")
+                config.reload(config_file)
+
                 # Analyze and open position
-                logger.info("Starting new cycle - analyzing funding rates...")
+                logger.info("Analyzing funding rates...")
 
                 # Fetch funding rates
                 logger.info(f"Analyzing funding rates for {len(config.symbols_to_monitor)} symbols...")
@@ -1798,6 +1852,7 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig):
                         # Calculate worst PnL (most negative) and determine exchange
                         worst_pnl = None
                         worst_exchange = None
+                        total_pnl = None
 
                         if aster_pnl is not None and lighter_pnl is not None:
                             if aster_pnl <= lighter_pnl:
@@ -1806,12 +1861,15 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig):
                             else:
                                 worst_pnl = lighter_pnl
                                 worst_exchange = "Lighter"
+                            total_pnl = aster_pnl + lighter_pnl
                         elif aster_pnl is not None:
                             worst_pnl = aster_pnl
                             worst_exchange = "Aster"
+                            total_pnl = aster_pnl
                         elif lighter_pnl is not None:
                             worst_pnl = lighter_pnl
                             worst_exchange = "Lighter"
+                            total_pnl = lighter_pnl
 
                         # Format worst PnL message with percentage and exchange
                         if worst_pnl is not None and worst_exchange and position_value > 0:
@@ -1861,21 +1919,36 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig):
 
                             pnl_color = Colors.GREEN if worst_pnl >= 0 else Colors.RED
                             pnl_str = f"{pnl_color}${worst_pnl:+.2f} ({pnl_pct:+.1f}% on {Colors.CYAN}{worst_exchange}{pnl_color}){Colors.RESET}"
+
+                            # Add total PnL if available
+                            total_pnl_str = ""
+                            if total_pnl is not None:
+                                total_pnl_pct = (total_pnl / position_value) * 100
+                                total_color = Colors.GREEN if total_pnl >= 0 else Colors.RED
+                                total_pnl_str = f" | Total PnL: {total_color}${total_pnl:+.2f} ({total_pnl_pct:+.1f}%){Colors.RESET}"
+
                             logger.info(
                                 f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} - "
                                 f"{Colors.BLUE}{Colors.BOLD}{time_remaining:.2f} hours{Colors.RESET} remaining | "
                                 f"Stop-loss: {Colors.YELLOW}{stop_loss_pct:.2f}%{Colors.RESET} | "
-                                f"Worst PnL: {pnl_str}"
+                                f"Worst PnL: {pnl_str}{total_pnl_str}"
                             )
                         elif worst_pnl is not None:
                             # Fallback if position_value couldn't be calculated
                             pnl_color = Colors.GREEN if worst_pnl >= 0 else Colors.RED
                             pnl_str = f"{pnl_color}${worst_pnl:+.2f} (on {Colors.CYAN}{worst_exchange}{pnl_color}){Colors.RESET}" if worst_exchange else f"{pnl_color}${worst_pnl:+.2f}{Colors.RESET}"
+
+                            # Add total PnL if available
+                            total_pnl_str = ""
+                            if total_pnl is not None:
+                                total_color = Colors.GREEN if total_pnl >= 0 else Colors.RED
+                                total_pnl_str = f" | Total PnL: {total_color}${total_pnl:+.2f}{Colors.RESET}"
+
                             logger.info(
                                 f"Holding position for {Colors.CYAN}{Colors.BOLD}{position['symbol']}{Colors.RESET} - "
                                 f"{Colors.BLUE}{Colors.BOLD}{time_remaining:.2f} hours{Colors.RESET} remaining | "
                                 f"Stop-loss: {Colors.YELLOW}{stop_loss_pct:.2f}%{Colors.RESET} | "
-                                f"Worst PnL: {pnl_str}"
+                                f"Worst PnL: {pnl_str}{total_pnl_str}"
                             )
                         else:
                             logger.info(
@@ -1954,7 +2027,7 @@ def main():
 
     # Run main loop
     try:
-        asyncio.run(main_loop(state_mgr, env, config))
+        asyncio.run(main_loop(state_mgr, env, config, args.config))
     except KeyboardInterrupt:
         logger.info("Shutting down gracefully...")
         state_mgr.set_state(BotState.SHUTDOWN)

@@ -12,15 +12,17 @@
     "LINK",
     "LTC",
     "ASTER",
-    "XPL"
+    "XPL",
+    "FARTCOIN",
+    "PUMP"
   ],
   "comment_quote": "Quote currency (USDT for Aster perp)",
   "quote": "USDT",
   "comment_leverage": "Leverage multiplier (1-5x recommended for safety)",
   "leverage": 1,
   "comment_notional": "Position size in USD per trade",
-  "notional_per_position": 100.0,
-  "comment_hold_duration": "How long to hold each position in hours (8h = 1 full Lighter funding cycle)",
+  "notional_per_position": 1000.0,
+  "comment_hold_duration": "How long to hold each position in hours (8h = 1 Aster funding cycle, 8 Lighter payments)",
   "hold_duration_hours": 8.0,
   "comment_wait": "Minutes to wait between position cycles",
   "wait_between_cycles_minutes": 5.0,
@@ -32,8 +34,6 @@
   "max_spread_pct": 0.15,
   "comment_stop_loss": "Enable automatic stop-loss based on leverage",
   "enable_stop_loss": true,
-  "comment_pnl_tracking": "Enable PnL tracking and reporting",
-  "enable_pnl_tracking": true,
-  "comment_health_monitoring": "Enable health monitoring during hold period",
-  "enable_health_monitoring": true
+  "comment_funding_refresh": "Minutes between funding rate table refreshes while holding position",
+  "funding_table_refresh_minutes": 5.0
 }
