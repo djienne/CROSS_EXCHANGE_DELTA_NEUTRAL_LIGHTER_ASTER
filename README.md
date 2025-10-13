@@ -11,6 +11,7 @@ This bot implements a cross-exchange delta-neutral trading strategy that:
 3. **Holds positions** for 8 hours to collect funding payments (configurable)
 4. **Closes positions** and realizes PnL
 5. **Repeats the cycle** automatically
+6. Use long (> 1 week) hold position time to do fundings rate farming, use short (< 1 day) hold position time to farm volume at low risk.
 
 ---
 
@@ -629,4 +630,5 @@ For issues or questions:
 ---
 
 **Disclaimer**: This bot is for educational and informational purposes only. It is not financial advice. Cryptocurrency trading carries significant risk. Always do your own research and consult with a financial advisor.
+
 
