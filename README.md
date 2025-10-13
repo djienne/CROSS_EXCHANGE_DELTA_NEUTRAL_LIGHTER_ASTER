@@ -24,8 +24,13 @@ This bot implements a cross-exchange delta-neutral trading strategy that:
 
 - ✅ **Delta-neutral** - Market-neutral exposure by going long and short simultaneously
 - ✅ **Funding rate arbitrage** - Profits from funding rate differences between exchanges
+- ✅ **Accurate funding rates** - Fetches current/upcoming rates from premium index, not historical data
+- ✅ **Dynamic interval detection** - Automatically detects 4h vs 8h funding intervals per symbol on Aster
+- ✅ **Capital validation** - Checks available balance before opening positions, auto-adjusts size if needed
+- ✅ **Safety margin** - Configurable capital buffer (default 95%) to account for fees and slippage
 - ✅ **Persistent state** - Recovers from crashes and restarts with automatic position reconciliation
 - ✅ **PnL tracking** - Real-time unrealized PnL monitoring: worst-leg PnL per exchange and total combined PnL with percentages (always active)
+- ✅ **Position size display** - Shows position size in both crypto units and USD notional during monitoring
 - ✅ **Stop-loss execution** - Automatic position closure when worst-leg PnL exceeds threshold (75% of liquidation threshold)
 - ✅ **Rate limiting** - Built-in retry logic with exponential backoff
 - ✅ **Color-coded output** - Easy-to-read terminal output with status colors
@@ -38,13 +43,19 @@ This bot implements a cross-exchange delta-neutral trading strategy that:
 The bot follows this flow (adapted from `lighter_edgex_hedge.py`):
 
 1. **Funding Rate Analysis**
-   - Fetches funding rates from both Lighter (24x/day) and Aster (3x/day)
-   - Calculates annualized APR for each exchange
+   - Fetches **current/upcoming** funding rates from premium index (Aster) and funding API (Lighter)
+   - Automatically detects funding intervals per symbol:
+     - **Aster**: 4h or 8h funding (6x/day or 3x/day) - detected dynamically from history
+     - **Lighter**: 8h funding (3x/day) - fixed
+   - Calculates annualized APR for each exchange based on detected intervals
    - Determines optimal hedge direction (long vs short on each exchange)
    - Filters by minimum APR threshold and spread constraints
 
 2. **Position Opening**
-   - Calculates position size based on available capital and leverage
+   - **Validates capital availability** on both exchanges before opening
+   - Calculates affordable position size with safety margin (default 95% of available)
+   - Automatically reduces position size if insufficient capital (logs adjustment warning)
+   - Skips trade entirely if capital too low (waits 5 minutes before retry)
    - Aligns size to both exchanges' tick sizes (precision)
    - Configures leverage on both exchanges
    - Places orders concurrently:
@@ -54,6 +65,7 @@ The bot follows this flow (adapted from `lighter_edgex_hedge.py`):
 
 3. **Position Holding**
    - Monitors position health every 60 seconds (configurable)
+   - Displays position size in both crypto units and USD notional
    - Tracks unrealized PnL on both exchanges in real-time
    - Displays worst-leg PnL (most negative) with percentage and exchange name
    - Displays total combined PnL (Lighter + Aster) with percentage
@@ -207,7 +219,8 @@ Edit `config.json` to customize bot behavior:
   "min_net_apr_threshold": 5.0,
   "max_spread_pct": 0.15,
   "enable_stop_loss": true,              // ✅ FUNCTIONAL - Closes position early if threshold breached
-  "funding_table_refresh_minutes": 5.0
+  "funding_table_refresh_minutes": 5.0,
+  "capital_safety_margin": 0.95          // ✅ NEW - Uses 95% of available capital (5% buffer for fees)
 }
 ```
 
@@ -235,6 +248,7 @@ The configuration file is automatically reloaded before opening each new positio
 - `max_spread_pct` - Adjust spread tolerance
 - `enable_stop_loss` - Enable/disable stop-loss
 - `funding_table_refresh_minutes` - Change refresh interval
+- `capital_safety_margin` - Adjust capital usage percentage
 - All other config parameters
 
 ### Parameter Reference
@@ -244,7 +258,7 @@ The configuration file is automatically reloaded before opening each new positio
 | `symbols_to_monitor` | list | `["BTC", "ETH", ...]` | Symbols to analyze (without USDT suffix) |
 | `quote` | string | `"USDT"` | Quote currency |
 | `leverage` | int | `3` | Leverage multiplier (1-5x recommended) |
-| `notional_per_position` | float | `100.0` | Position size in USD |
+| `notional_per_position` | float | `100.0` | Position size in USD (max requested, auto-adjusted if insufficient capital) |
 | `hold_duration_hours` | float | `8.0` | Hold duration (8h = 1 Aster funding cycle, 8 Lighter payments) |
 | `wait_between_cycles_minutes` | float | `5.0` | Wait time between cycles |
 | `check_interval_seconds` | int | `60` | Position health check interval |
@@ -252,6 +266,7 @@ The configuration file is automatically reloaded before opening each new positio
 | `max_spread_pct` | float | `0.15` | Maximum cross-exchange spread (%) |
 | `enable_stop_loss` | bool | `true` | Enable automatic stop-loss execution (closes position early if threshold breached) |
 | `funding_table_refresh_minutes` | float | `5.0` | Funding rate table refresh interval during hold |
+| `capital_safety_margin` | float | `0.95` | Percentage of available capital to use (0.95 = 95%, keeps 5% buffer for fees/slippage) |
 
 ## 🚀 Usage
 
@@ -308,8 +323,8 @@ python emergency_exit.py
 The bot maintains persistent state in `bot_state.json`:
 
 - **Current state**: IDLE, ANALYZING, OPENING, HOLDING, CLOSING, WAITING, ERROR
-- **Current position**: Active position details (symbol, exchanges, leverage, timestamps, metadata)
-- **Capital status**: Balance and available capital on both exchanges ⚠️ *Not currently populated*
+- **Current position**: Active position details (symbol, exchanges, leverage, timestamps, metadata, actual vs requested notional)
+- **Capital status**: ✅ **Populated** - Balance and available capital on both exchanges, max position notional, limiting exchange
 - **Completed cycles**: Historical cycle data (symbol, timestamps, status, expected APR, stop-loss details)
 - **Cumulative stats**:
   - ✅ **Working**: `total_cycles`, `successful_cycles`, `failed_cycles`, `last_error`, `last_error_at`
@@ -353,8 +368,9 @@ The bot displays color-coded real-time information:
 
 **Enhanced Holding Display:**
 ```
-Holding position for BTCUSDT - 7.60 hours remaining | Stop-loss: 25.00% | Worst PnL: $-1.76 (-0.9% on Aster) | Total PnL: $+0.43 (+0.2%)
+Holding position for BTCUSDT (0.0025 BTC / $114.82) - 7.60 hours remaining | Stop-loss: 25.00% | Worst PnL: $-1.76 (-0.9% on Aster) | Total PnL: $+0.43 (+0.2%)
 ```
+- Shows position size in both crypto units and USD notional value
 - Shows calculated stop-loss threshold (75% of liquidation level)
 - Displays worst-leg unrealized PnL in dollars and percentage
 - Identifies which exchange has the worst PnL (used for stop-loss calculation)
@@ -395,11 +411,15 @@ Closing position early due to stop-loss...
 
 This protects against liquidation while accounting for normal market volatility.
 
-### 📏 Position Limits
+### 📏 Position Limits & Capital Management
 
-- **Minimum position**: $10 USD equivalent
-- **Maximum position**: Limited by available capital * leverage
-- **Capital check**: Bot verifies sufficient capital before opening
+- **Minimum position**: $10 USD equivalent per exchange
+- **Maximum position**: Limited by available capital * leverage on the exchange with less funds
+- **Capital validation**: Bot fetches balances from both exchanges before each position
+- **Automatic adjustment**: Reduces position size to affordable amount with 5% safety buffer
+- **Insufficient capital**: Skips trade and waits 5 minutes if capital too low
+- **Safety margin**: Configurable buffer (default 95%) protects against fees and slippage
+- **Transparent logging**: Clear warnings when position size is adjusted due to capital constraints
 
 ### 📐 Spread Filtering
 
@@ -435,14 +455,18 @@ Provides methods for Aster exchange:
 ## 💰 Funding Rate Mechanics
 
 ### Lighter
-- **Frequency**: Every 1 hour (24x per day)
-- **Times**: Every hour UTC (00:00, 01:00, 02:00, ...)
-- **APR calculation**: `rate * 24 * 365 * 100`
-
-### Aster
 - **Frequency**: Every 8 hours (3x per day)
 - **Times**: 00:00, 08:00, 16:00 UTC
 - **APR calculation**: `rate * 3 * 365 * 100`
+- **Rate source**: Fetched from Lighter funding rate API (historical endpoint)
+
+### Aster
+- **Frequency**: Varies by symbol
+  - **Most symbols**: Every 8 hours (3x per day) - 00:00, 08:00, 16:00 UTC
+  - **Some symbols** (e.g., XPL, ASTER): Every 4 hours (6x per day) - 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+- **APR calculation**: `rate * periods_per_day * 365 * 100` (dynamically detected)
+- **Rate source**: Fetched from premium index endpoint (`/fapi/v1/premiumIndex`) for current/upcoming rate
+- **Interval detection**: Bot automatically detects funding frequency by analyzing timestamp differences in history
 
 ### Net APR
 
@@ -463,6 +487,17 @@ If Long Lighter + Short Aster:
 2025-10-13 10:00:00 - Monitoring 9 symbols
 2025-10-13 10:00:00 - Leverage: 3x, Notional: $100.0
 2025-10-13 10:00:00 - Hold duration: 8.0 hours
+
+Fetching initial capital status from exchanges...
+════════════════════════════════════════════════════════════════════════════════
+CAPITAL STATUS
+════════════════════════════════════════════════════════════════════════════════
+  Aster:   Total: $523.45 | Available: $520.12
+  Lighter:  Total: $487.23 | Available: $485.00
+  Combined: Total: $1,010.68 | Available: $1,005.12
+  Max Position Notional: $1,455.00 (limited by Lighter)
+  Configured Notional: $100.00
+════════════════════════════════════════════════════════════════════════════════
 
 ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
                                                         FUNDING RATE ANALYSIS
@@ -498,9 +533,9 @@ Verifying positions...
   Delta-neutral: LONG Aster, SHORT Lighter
 
 2025-10-13 10:00:10 - Position opened successfully, now holding...
-2025-10-13 11:00:10 - Holding position for LTCUSDT - 7.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-1.23 (-0.6% on Lighter) | Total PnL: $+0.45 (+0.2%)
-2025-10-13 12:00:10 - Holding position for LTCUSDT - 6.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $+0.58 (+0.3% on Lighter) | Total PnL: $+1.82 (+0.9%)
-2025-10-13 13:00:10 - Holding position for LTCUSDT - 5.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-0.34 (-0.2% on Aster) | Total PnL: $+0.98 (+0.5%)
+2025-10-13 11:00:10 - Holding position for LTCUSDT (2.0620 LTC / $200.22) - 7.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-1.23 (-0.6% on Lighter) | Total PnL: $+0.45 (+0.2%)
+2025-10-13 12:00:10 - Holding position for LTCUSDT (2.0620 LTC / $200.22) - 6.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $+0.58 (+0.3% on Lighter) | Total PnL: $+1.82 (+0.9%)
+2025-10-13 13:00:10 - Holding position for LTCUSDT (2.0620 LTC / $200.22) - 5.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-0.34 (-0.2% on Aster) | Total PnL: $+0.98 (+0.5%)
 
 [Refreshing funding rate table every 5 minutes...]
 
@@ -534,9 +569,9 @@ Verifying closure...
 
 ```
 2025-10-13 10:00:10 - Position opened successfully, now holding...
-2025-10-13 11:00:10 - Holding position for BTCUSDT - 7.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-12.34 (-6.2% on Lighter) | Total PnL: $-8.50 (-4.3%)
-2025-10-13 12:00:10 - Holding position for BTCUSDT - 6.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-38.50 (-19.3% on Lighter) | Total PnL: $-32.10 (-16.1%)
-2025-10-13 12:30:10 - Holding position for BTCUSDT - 5.50 hours remaining | Stop-loss: 25.00% | Worst PnL: $-52.75 (-26.4% on Lighter) | Total PnL: $-45.20 (-22.6%)
+2025-10-13 11:00:10 - Holding position for BTCUSDT (0.0022 BTC / $100.54) - 7.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-12.34 (-6.2% on Lighter) | Total PnL: $-8.50 (-4.3%)
+2025-10-13 12:00:10 - Holding position for BTCUSDT (0.0022 BTC / $100.54) - 6.00 hours remaining | Stop-loss: 25.00% | Worst PnL: $-38.50 (-19.3% on Lighter) | Total PnL: $-32.10 (-16.1%)
+2025-10-13 12:30:10 - Holding position for BTCUSDT (0.0022 BTC / $100.54) - 5.50 hours remaining | Stop-loss: 25.00% | Worst PnL: $-52.75 (-26.4% on Lighter) | Total PnL: $-45.20 (-22.6%)
 
 ⚠️  STOP-LOSS TRIGGERED! Worst PnL: -26.4% >= 25.00% threshold on Lighter
 Closing position early due to stop-loss...
@@ -618,6 +653,11 @@ This demonstrates the bot's key features in action: persistent state management,
 
 ### Recently Fixed (2025-10-13)
 - ✅ **Stop-loss execution** - Stop-loss was previously calculated and displayed but never executed. This has been fixed and now properly closes positions early when threshold is breached.
+- ✅ **Funding rate accuracy** - Now fetches current/upcoming rates from premium index instead of historical rates
+- ✅ **Dynamic funding intervals** - Automatically detects 4h vs 8h funding on Aster per symbol
+- ✅ **Lighter APR calculation** - Fixed from 24x/day to correct 3x/day (8-hour intervals)
+- ✅ **Capital validation** - Bot now checks balances before opening positions and auto-adjusts size if needed
+- ✅ **Capital status tracking** - Now properly populated with balance data from both exchanges
 
 ### Current Limitations
 
@@ -628,8 +668,6 @@ This demonstrates the bot's key features in action: persistent state management,
    - Total volume traded
    - Total hold time hours
    - Per-symbol breakdowns
-
-2. **Capital Status** - The capital status fields in state are defined but not currently populated with exchange balance data.
 
 ### Planned Features
 

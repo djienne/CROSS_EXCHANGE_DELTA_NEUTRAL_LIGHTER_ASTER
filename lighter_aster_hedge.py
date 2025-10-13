@@ -1891,6 +1891,14 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
     if not capital_ok:
         logger.error("Failed to fetch initial capital status. Continuing anyway...")
 
+    # Display initial funding rate table at startup
+    logger.info("Fetching initial funding rates...")
+    try:
+        await fetch_and_display_funding_rates(env, aster, config, current_symbol=None)
+    except Exception as e:
+        logger.error(f"Failed to fetch initial funding rates: {e}")
+        logger.info("Continuing to main loop...")
+
     try:
         while True:
             current_state = state_mgr.get_state()
