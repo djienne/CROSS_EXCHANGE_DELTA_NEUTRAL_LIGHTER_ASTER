@@ -146,7 +146,7 @@ cp .env.example .env
    - `ASTER_APIV1_PRIVATE` - API private key
 
    **For Lighter**:
-   - `LIGHTER_PRIVATE_KEY` or `API_KEY_PRIVATE_KEY` - Your Lighter private key
+   - `API_KEY_PRIVATE_KEY` - Your Lighter private key
    - `ACCOUNT_INDEX` - Lighter account index (usually 0)
    - `API_KEY_INDEX` - Lighter API key index (usually 0)
 
@@ -625,4 +625,3 @@ For issues or questions:
 ---
 
 **Disclaimer**: This bot is for educational and informational purposes only. It is not financial advice. Cryptocurrency trading carries significant risk. Always do your own research and consult with a financial advisor.
-
