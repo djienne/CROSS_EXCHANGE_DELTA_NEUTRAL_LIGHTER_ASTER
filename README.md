@@ -90,7 +90,6 @@ requirements.txt             # Python dependencies
 bot_state.json               # Persistent state (auto-generated)
 logs/                        # Log files (auto-generated)
 README.md                    # This file
-EMERGENCY_EXIT_README.md     # Emergency exit documentation
 ```
 
 ## ✅ Prerequisites
@@ -303,8 +302,6 @@ python emergency_exit.py
 - Bot malfunction or stuck state
 - Manual intervention needed outside normal cycle
 - Risk management - reduce exposure immediately
-
-**See [EMERGENCY_EXIT_README.md](EMERGENCY_EXIT_README.md) for detailed documentation.**
 
 ## 💾 State Management
 
