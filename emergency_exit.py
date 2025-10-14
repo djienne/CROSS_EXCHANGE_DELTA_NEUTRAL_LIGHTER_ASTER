@@ -18,7 +18,7 @@ Usage:
 import asyncio
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, UTC
 from dotenv import load_dotenv
 import lighter
 
@@ -43,7 +43,7 @@ def print_header():
     print(f"\n{Colors.BOLD}{Colors.RED}{'═' * 100}")
     print(f"{'EMERGENCY EXIT - DELTA NEUTRAL POSITION CLOSER':^100}")
     print(f"{'═' * 100}{Colors.RESET}\n")
-    print(f"{Colors.GRAY}Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC{Colors.RESET}\n")
+    print(f"{Colors.GRAY}Timestamp: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC{Colors.RESET}\n")
 
 
 def load_env() -> dict:
@@ -117,6 +117,12 @@ async def get_all_positions(env: dict, aster: AsterApiManager) -> dict:
         # Get Lighter positions
         print("  Checking Lighter...")
         lighter_positions = await lighter_client.get_all_lighter_positions(account_api, env["ACCOUNT_INDEX"])
+
+        # Add 'side' field to Lighter positions based on size
+        for pos in lighter_positions:
+            size = pos.get('size', 0)
+            pos['side'] = 'LONG' if size > 0 else 'SHORT'
+
         print(f"    Found {len(lighter_positions)} position(s)\n")
 
         await api_client.close()
