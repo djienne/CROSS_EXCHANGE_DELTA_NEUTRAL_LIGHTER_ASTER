@@ -84,10 +84,13 @@ The main bot (`lighter_aster_hedge.py`) operates as a state machine with these s
 ### Data Flow
 
 1. **Funding Rate Analysis**:
-   - Fetch from Aster: `aster.get_premium_index()` → Current/upcoming rate (not historical)
+   - **Caching**: Check 5-minute cache first to reduce API calls (`get_cached_funding()`)
+   - Fetch from Aster: `aster.get_premium_index()` → Current/upcoming rate (forward-looking, not historical)
    - Detect funding interval: Analyze `get_funding_rate_history()` timestamps (4h or 8h)
-   - Fetch from Lighter: `lighter_client.get_lighter_funding_rate()` → 3x/day rate (8h intervals)
-   - Calculate annualized APR: `rate * periods_per_day * 365 * 100` (periods_per_day detected dynamically for Aster)
+   - Fetch from Lighter: `lighter_client.get_lighter_funding_rate()` → Current/upcoming rate (forward-looking)
+   - **Lighter funding**: Effective 8-hour intervals (3x/day) despite hourly sampling in calculation
+   - Calculate annualized APR: `rate * periods_per_day * 365 * 100` (periods_per_day=3 for Lighter, detected dynamically for Aster)
+   - **Cache results**: Store rates for 5 minutes (`set_cached_funding()`) to prevent redundant API calls
    - Determine optimal direction: `max(aster_apr - lighter_apr, lighter_apr - aster_apr)`
    - Filter by spread and APR threshold
 
@@ -218,18 +221,39 @@ The verification is non-blocking (continues even if verification fails).
 - **Most symbols**: Every 8 hours (3x/day)
 - **Some symbols** (e.g., XPL, ASTER): Every 4 hours (6x/day)
 - **Detection**: Bot fetches 2 history records and calculates time difference
-- **Rate source**: Premium index endpoint (`/fapi/v1/premiumIndex`) for current/upcoming rate
+- **Rate source**: Premium index endpoint (`/fapi/v1/premiumIndex`) for current/upcoming rate (forward-looking)
+- **Rate format**: Forward-looking (represents upcoming funding, not historical)
 ```python
 # Detected dynamically per symbol
 aster_apr = aster_rate * aster_periods_per_day * 365 * 100
 ```
 
-**Lighter**: Funding every 8 hours (3x/day) - fixed
+**Lighter**: Funding effectively every 8 hours (3x/day)
+- **Rate source**: `/api/v1/funding-rates` endpoint (forward-looking)
+- **Calculation methodology**: Lighter samples premiums every hour and divides by 8, but the effective funding interval is 8 hours
+- **Rate format**: Forward-looking (represents upcoming funding, not historical)
+- **API returns**: 8-hour equivalent rate (comparable to other 8-hour exchanges like Binance)
 ```python
-lighter_apr = lighter_rate * 3 * 365 * 100  # Convert to annualized %
+lighter_apr = lighter_rate * 3 * 365 * 100  # 3 periods per day (8-hour intervals)
 ```
 
+**Important**: Lighter's documentation mentions "funding payments occur at each hour mark" which refers to their *sampling methodology*, not the actual payment frequency. The rate returned by their API is an 8-hour equivalent rate (divided by 8), making it directly comparable to other exchanges with 8-hour funding intervals.
+
 **Net APR** is the difference between receiving and paying rates. The bot chooses the direction that maximizes net APR.
+
+### Funding Rate Caching
+
+The bot implements a 5-minute cache for funding rates to:
+- Reduce API calls and avoid rate limiting
+- Improve performance during multi-symbol analysis
+- Minimize network latency
+
+Cache implementation:
+- **TTL**: 300 seconds (5 minutes)
+- **Key**: `(symbol, quote, exchange)` tuple
+- **Storage**: In-memory dictionary with timestamps
+- **Auto-expiry**: Expired entries removed on next access
+- **Functions**: `get_cached_funding()`, `set_cached_funding()`, `clear_funding_cache()`
 
 ### Capital Management
 

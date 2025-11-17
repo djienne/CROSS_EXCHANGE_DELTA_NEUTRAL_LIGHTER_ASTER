@@ -142,6 +142,64 @@ async def retry_with_backoff(
 # Global semaphore to limit concurrent Lighter API calls
 LIGHTER_API_SEMAPHORE = asyncio.Semaphore(2)  # Max 2 concurrent Lighter API calls
 
+# ==================== Funding Rate Caching ====================
+
+# Global funding cache: (symbol, quote, exchange) -> (value, timestamp)
+# Value can be a float (for Lighter) or Tuple[float, int] (for Aster with periods_per_day)
+from typing import Any, Union
+FUNDING_CACHE: Dict[Tuple[str, str, str], Tuple[Any, datetime]] = {}
+FUNDING_CACHE_TTL_SECONDS = 300  # 5 minutes default
+
+
+def get_cached_funding(symbol: str, quote: str, exchange: str) -> Optional[Union[float, Tuple[float, int]]]:
+    """
+    Get cached funding rate if available and not expired.
+
+    Args:
+        symbol: Trading symbol (e.g., "BTC")
+        quote: Quote currency (e.g., "USDT")
+        exchange: Exchange name (e.g., "Lighter", "Aster")
+
+    Returns:
+        Cached value if valid, None otherwise.
+        For Lighter: float rate
+        For Aster: Tuple[float rate, int periods_per_day]
+    """
+    cache_key = (symbol.upper(), quote.upper(), exchange.lower())
+
+    if cache_key not in FUNDING_CACHE:
+        return None
+
+    value, timestamp = FUNDING_CACHE[cache_key]
+    age_seconds = (datetime.now(timezone.utc) - timestamp).total_seconds()
+
+    if age_seconds < FUNDING_CACHE_TTL_SECONDS:
+        return value
+
+    # Cache expired, remove it
+    del FUNDING_CACHE[cache_key]
+    return None
+
+
+def set_cached_funding(symbol: str, quote: str, exchange: str, value: Union[float, Tuple[float, int]]) -> None:
+    """
+    Store funding rate in cache with current timestamp.
+
+    Args:
+        symbol: Trading symbol (e.g., "BTC")
+        quote: Quote currency (e.g., "USDT")
+        exchange: Exchange name (e.g., "Lighter", "Aster")
+        value: Funding value to cache (float for Lighter, Tuple[float, int] for Aster)
+    """
+    cache_key = (symbol.upper(), quote.upper(), exchange.lower())
+    FUNDING_CACHE[cache_key] = (value, datetime.now(timezone.utc))
+
+
+def clear_funding_cache() -> None:
+    """Clear all cached funding rates."""
+    FUNDING_CACHE.clear()
+
+
 # ==================== Logging Setup ====================
 
 os.makedirs('logs', exist_ok=True)
@@ -701,6 +759,13 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
             Tuple of (rate, periods_per_day) or None if failed
         """
         logger.debug(f"fetch_aster_rate: Starting for {symbol}")
+
+        # Check cache first
+        cached_value = get_cached_funding(symbol, "USDT", "Aster")
+        if cached_value is not None and isinstance(cached_value, tuple):
+            logger.debug(f"fetch_aster_rate: Using cached value {cached_value} for {symbol}")
+            return cached_value
+
         try:
             # First, try to get current funding rate from premium index (more accurate)
             try:
@@ -736,7 +801,11 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
                     except Exception as e:
                         logger.debug(f"fetch_aster_rate: Could not detect interval for {symbol}, using default: {e}")
 
-                return (current_rate, periods_per_day)
+                result = (current_rate, periods_per_day)
+                # Cache the result
+                set_cached_funding(symbol, "USDT", "Aster", result)
+                logger.debug(f"fetch_aster_rate: Cached result {result} for {symbol}")
+                return result
 
             except Exception as premium_err:
                 # Fallback to history if premium index fails
@@ -771,7 +840,11 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
                     except Exception as e:
                         logger.debug(f"fetch_aster_rate: Could not detect interval for {symbol}, using default: {e}")
 
-                return (rate, periods_per_day)
+                result = (rate, periods_per_day)
+                # Cache the result
+                set_cached_funding(symbol, "USDT", "Aster", result)
+                logger.debug(f"fetch_aster_rate: Cached result {result} for {symbol}")
+                return result
 
         except Exception as exc:
             logger.error("Error fetching Aster funding for %s: %s", symbol, exc, exc_info=True)
@@ -779,6 +852,13 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
 
     async def fetch_lighter_rate() -> Optional[float]:
         logger.debug(f"fetch_lighter_rate: Starting for {symbol}")
+
+        # Check cache first
+        symbol_clean = symbol.replace("USDT", "")
+        cached_rate = get_cached_funding(symbol_clean, "USDT", "Lighter")
+        if cached_rate is not None:
+            logger.debug(f"fetch_lighter_rate: Using cached rate {cached_rate} for {symbol_clean}")
+            return cached_rate
 
         async def _fetch_with_semaphore():
             api_client = None
@@ -815,6 +895,10 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
             logger.debug(f"fetch_lighter_rate: Starting retry_with_backoff for {symbol}")
             result = await retry_with_backoff(_fetch_with_semaphore, max_retries=3, initial_delay=2.0)
             logger.debug(f"fetch_lighter_rate: Success for {symbol}, rate={result}")
+            # Cache the rate if successful
+            if result is not None:
+                set_cached_funding(symbol_clean, "USDT", "Lighter", result)
+                logger.debug(f"fetch_lighter_rate: Cached rate {result} for {symbol_clean}")
             return result
         except RateLimitError as exc:
             logger.error("Lighter rate limit exceeded for %s after retries: %s", symbol, exc)
