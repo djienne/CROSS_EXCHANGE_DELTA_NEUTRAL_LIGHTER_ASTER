@@ -1,0 +1,25 @@
+# Secrets — Aster and Lighter keys live here
+.env
+
+# Runtime state
+bot_state.json
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Editor/tooling backups - never commit
+*.bak
+*.bak-*
