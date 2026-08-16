@@ -478,6 +478,46 @@ async def get_all_lighter_positions(account_api, account_index: int) -> list:
     return positions
 
 
+async def list_lighter_positions(account_api, account_index: int) -> Dict[str, float]:
+    """Account-level {symbol: signed_size} for every non-zero position. RAISES on failure.
+
+    Deliberately separate from `get_all_lighter_positions`, which swallows its
+    exceptions and returns an empty list. An empty list is indistinguishable from "the
+    account is flat", and boot reconciliation acts on exactly that distinction: if a
+    listing failure reads as flat, the bot concludes it has no positions, wipes its
+    state and opens a fresh hedge on top of the one it just failed to see.
+
+    `get_all_lighter_positions` keeps its old forgiving behaviour for the display-only
+    callers (check_lighter_positions.py, emergency_exit.py); anything that makes a
+    trading decision must use this one.
+    """
+    try:
+        response = await account_api.account(by="index", value=str(account_index))
+    except Exception as e:
+        raise PositionFetchError(
+            f"Lighter account listing failed for account {account_index}: {e}"
+        ) from e
+
+    if not (response and response.accounts):
+        raise PositionFetchError(
+            f"Lighter returned no account payload for index {account_index}; "
+            f"refusing to interpret that as a flat account."
+        )
+
+    positions: Dict[str, float] = {}
+    for pos in (response.accounts[0].positions or []):
+        try:
+            signed = float(pos.position or "0") * int(pos.sign or 0)
+        except (TypeError, ValueError):
+            continue
+        symbol = getattr(pos, "symbol", None)
+        if symbol and abs(signed) > 1e-12:
+            positions[str(symbol)] = signed
+
+    logger.info("Lighter: %d non-zero position(s) for account %s", len(positions), account_index)
+    return positions
+
+
 async def get_lighter_funding_rate(api_or_client, market_id: int) -> Optional[float]:
     """
     Get current funding rate from Lighter for a specific market.
@@ -509,6 +549,71 @@ async def get_lighter_funding_rate(api_or_client, market_id: int) -> Optional[fl
     except Exception as e:
         logger.warning(f"Could not fetch Lighter funding rate for market {market_id}: {e}")
         return None
+
+
+async def lighter_cancel_open_orders(
+    signer: lighter.SignerClient,
+    order_api,
+    account_index: int,
+    market_id: int,
+) -> int:
+    """Cancel every resting order this account holds on `market_id`. Returns the count.
+
+    Why this must exist: the bot places GOOD_TILL_TIME orders, so an unfilled remainder
+    stays live on the book. Reading a position back as zero without cancelling first
+    does NOT mean the leg is dead - it can fill minutes later and re-open a naked leg
+    long after the bot has closed the cycle and forgotten it.
+    `two_leg._submit_and_verify` calls this before every verification for that reason.
+
+    Scoped to one market deliberately. `SignerClient.cancel_all_orders` would do this
+    in a single call, but it is ACCOUNT-WIDE (TX_TYPE_CANCEL_ALL_ORDERS): it would also
+    cancel resting orders belonging to any other strategy sharing this Lighter account.
+    """
+    auth_token, err = signer.create_auth_token_with_expiry(
+        lighter.SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY
+    )
+    if err is not None:
+        raise RuntimeError(f"Lighter: could not create auth token to list orders: {err}")
+
+    # NOTE: the installed lighter SDK takes `authorization` only. The vendored docs in
+    # doc/Lighter show an additional `auth=` kwarg; that is a different SDK revision and
+    # passing it here raises TypeError. Verify against the installed signature, not the
+    # bundled reference, before changing this call.
+    resp = await order_api.account_active_orders(
+        authorization=auth_token,
+        account_index=account_index,
+        market_id=market_id,
+    )
+    orders = getattr(resp, "orders", None) or []
+    if not orders:
+        return 0
+
+    cancelled = 0
+    for order in orders:
+        order_index = getattr(order, "order_index", None)
+        if order_index is None:
+            logger.warning("Lighter: active order without order_index, skipping: %r", order)
+            continue
+
+        _, _, cancel_err = await signer.cancel_order(
+            market_index=market_id,
+            order_index=int(order_index),
+        )
+        if cancel_err:
+            # Most likely it filled or was already gone between the list and the
+            # cancel. Log and continue rather than abort: the verification read that
+            # follows decides the truth, and bailing out here would leave the
+            # remaining orders resting.
+            logger.warning(
+                "Lighter: cancel failed for order_index=%s on market %s: %s",
+                order_index, market_id, cancel_err,
+            )
+            continue
+        cancelled += 1
+
+    if cancelled:
+        logger.info("Lighter: cancelled %d resting order(s) on market %s", cancelled, market_id)
+    return cancelled
 
 
 async def lighter_place_aggressive_order(

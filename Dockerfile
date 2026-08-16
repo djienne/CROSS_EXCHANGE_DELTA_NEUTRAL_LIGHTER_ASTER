@@ -23,10 +23,23 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# Copy application files.
+#
+# ALL runtime modules must be listed here. The image previously copied only four files
+# and omitted two_leg.py, funding_economics.py, utils.py and strategy_logic.py, every
+# one of which is imported at startup - directly by lighter_aster_hedge.py or by
+# aster_api_manager.py. The container only ran because docker-compose bind-mounts the
+# whole source directory over /app, which masked the broken image entirely. Anyone
+# running `docker run` on it got an ImportError.
 COPY lighter_aster_hedge.py .
 COPY lighter_client.py .
 COPY aster_api_manager.py .
+COPY two_leg.py .
+COPY funding_economics.py .
+COPY utils.py .
+COPY strategy_logic.py .
+COPY emergency_exit.py .
+COPY check_lighter_positions.py .
 COPY config.json .
 
 # Create logs directory

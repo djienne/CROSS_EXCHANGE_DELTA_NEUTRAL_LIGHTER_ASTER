@@ -358,6 +358,83 @@ class AsterApiManager:
         }
         return await self._signed_request_v3('POST', '/fapi/v3/order', params)
 
+    async def get_perp_open_orders(self, symbol: str) -> list:
+        """List resting (unfilled) perpetual orders for a symbol.
+
+        Required by the two-leg execution primitive: a position read of zero only
+        means "flat" once you also know nothing is still resting on the book. Without
+        this, a cancelled-looking leg can fill minutes later.
+
+        Aster's v1 fapi endpoints authenticate with HMAC-SHA256 rather than the v3
+        Ethereum signature, which is why this routes through _make_spot_request with
+        base_url=FUTURES_BASE_URL, exactly as set_perp_leverage does.
+        """
+        result = await self._make_spot_request(
+            method='GET',
+            path='/fapi/v1/openOrders',
+            params={'symbol': symbol},
+            signed=True,
+            base_url=FUTURES_BASE_URL,
+        )
+        return result if isinstance(result, list) else []
+
+    async def cancel_all_perp_orders(self, symbol: str) -> int:
+        """Cancel every resting perpetual order for `symbol`. Returns the count cancelled.
+
+        Deliberately scoped to one symbol. This exchange account may be shared with
+        other strategies, and a cancel-everything call would reach into orders this
+        bot never placed.
+        """
+        open_orders = await self.get_perp_open_orders(symbol)
+        if not open_orders:
+            return 0
+
+        await self._make_spot_request(
+            method='DELETE',
+            path='/fapi/v1/allOpenOrders',
+            params={'symbol': symbol},
+            signed=True,
+            base_url=FUTURES_BASE_URL,
+        )
+        return len(open_orders)
+
+    async def get_funding_info(self) -> list:
+        """Per-symbol funding metadata, including `fundingIntervalHours`.
+
+        Public endpoint, no auth. This is the authoritative source for a symbol's
+        funding cadence. Aster runs 1h, 4h and 8h intervals simultaneously across
+        symbols, so inferring the interval from two history timestamps (a single gap)
+        is wrong whenever that gap is irregular, and falling back to a constant
+        silently doubles or halves every APR derived from it.
+        """
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        url = f"{FUTURES_BASE_URL}/fapi/v1/fundingInfo"
+        async with self.session.get(url) as response:
+            response.raise_for_status()
+            result = await response.json()
+        return result if isinstance(result, list) else []
+
+    async def get_all_perp_positions(self) -> Dict[str, float]:
+        """Account-level map of {symbol: signed position size} for every open position.
+
+        Account-level on purpose. Recovery that only scans `symbols_to_monitor` cannot
+        see a position in a symbol since removed from the config - which has already
+        happened in this codebase - so the bot declares itself flat and opens a second
+        position on top of an abandoned one. two_leg.boot_reconcile consumes this.
+        """
+        account_info = await self.get_perp_account_info()
+        positions: Dict[str, float] = {}
+        for pos in account_info.get('positions', []) or []:
+            try:
+                size = float(pos.get('positionAmt', 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            symbol = pos.get('symbol')
+            if symbol and size:
+                positions[symbol] = size
+        return positions
+
     async def get_perp_leverage(self, symbol: str) -> int:
         """Get current leverage for a perpetual trading symbol."""
         account_info = await self.get_perp_account_info()

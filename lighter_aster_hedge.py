@@ -34,7 +34,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 
 from dotenv import load_dotenv
 import lighter
@@ -42,11 +42,26 @@ import lighter
 import lighter_client
 from aster_api_manager import AsterApiManager
 from two_leg import (
+    HALT_FILENAME,
+    BootReconcileError,
     HaltedError,
-    LegStatus,
+    LegSpec,
     assert_not_halted,
-    classify_submission,
+    boot_reconcile,
+    execute_two_leg,
+    unwind_leg,
     write_halt,
+)
+from funding_economics import (
+    FundingInterval,
+    FundingIntervalResolver,
+    IntervalResolutionError,
+    TradeCostModel,
+    VenueCosts,
+    VERIFIED_TAKER_BPS,
+    annualize,
+    break_even_apr_pct,
+    evaluate_entry,
 )
 
 # ANSI color codes for console output
@@ -149,6 +164,11 @@ async def retry_with_backoff(
 # Global semaphore to limit concurrent Lighter API calls
 LIGHTER_API_SEMAPHORE = asyncio.Semaphore(2)  # Max 2 concurrent Lighter API calls
 
+# Shared per-symbol funding-interval cache. Successes are cached with a TTL; failures
+# are NEVER cached, so one transient API error cannot pin a symbol at a wrong interval
+# for the life of the process.
+FUNDING_RESOLVER = FundingIntervalResolver()
+
 # ==================== Logging Setup ====================
 
 os.makedirs('logs', exist_ok=True)
@@ -225,6 +245,21 @@ def load_env() -> dict:
 
 # ==================== State Management ====================
 
+class ConfigError(RuntimeError):
+    """Raised when the configuration cannot be trusted.
+
+    Deliberately fatal. The previous behaviour was to log the error and return
+    `BotConfig(symbols_to_monitor=DEFAULT_SYMBOLS)`, which silently substituted the
+    hardcoded defaults for every tuned parameter. That is not a degraded mode, it is
+    a different strategy: config.json asks for 1x leverage, a 24h hold and a 60% APR
+    gate; the defaults are 3x, 8h and 5%. The 5% gate sits far below the 87.6%
+    break-even of an 8h hold, so the fallback traded at a structural loss while
+    reporting that it had loaded fine.
+
+    A trading bot that cannot read its own risk parameters must not trade.
+    """
+
+
 class BotState:
     """State machine for the rotation bot."""
     IDLE = "IDLE"
@@ -252,100 +287,152 @@ class BotConfig:
     enable_stop_loss: bool = True
     funding_table_refresh_minutes: float = 5.0
     capital_safety_margin: float = 0.95
+    # Per-leg, one-way slippage charged on top of the venue taker fee, in basis
+    # points. 0.0 reproduces the fee-only round trip this bot has always assumed
+    # (Aster taker 4bps x 2 legs = 0.080%). It is almost certainly optimistic: the
+    # bot crosses the spread on both venues, twice per cycle. Calibrate it from
+    # realised fills - the difference between avg_mid at open and the actual entry
+    # price - rather than leaving it at zero.
+    slippage_bps_per_leg: float = 0.0
 
-    @staticmethod
-    def load_from_file(config_file: str) -> 'BotConfig':
-        """Load configuration from JSON file."""
+    @classmethod
+    def _clean(cls, data: dict, source: str) -> Dict[str, object]:
+        """Drop documentation keys and reject anything that is not a real field.
+
+        Whitelisting against the dataclass field set is the point. The old filter was
+        `not k.startswith('comment')`, which let `_comment_hold_duration_hours` through
+        into `BotConfig(**data)` -> TypeError -> silent all-defaults fallback. Matching
+        on the field set means no comment convention can reach the constructor, and a
+        misspelled key is an error rather than a silent default on a risk parameter.
+        """
+        known = {f.name for f in fields(cls)}
+        cleaned: Dict[str, object] = {}
+        unknown: List[str] = []
+
+        for key, value in data.items():
+            if "comment" in key.lower():
+                continue
+            if key in known:
+                cleaned[key] = value
+            else:
+                unknown.append(key)
+
+        if unknown:
+            raise ConfigError(
+                f"{source}: unknown configuration key(s) {sorted(unknown)}. "
+                f"Valid keys are {sorted(known)}. A misspelled key would otherwise "
+                f"fall back to a default silently, so this refuses to guess."
+            )
+        if not cleaned.get("symbols_to_monitor"):
+            raise ConfigError(f"{source}: 'symbols_to_monitor' is required and must be non-empty")
+
+        defaults_by_name = {f.name: f.default for f in fields(cls)}
+        for name in sorted(known - set(cleaned)):
+            logger.info("%s: %s not set, using default %r", source, name,
+                        defaults_by_name.get(name))
+        return cleaned
+
+    def validate(self, source: str = "config") -> None:
+        """Reject values that are out of range before any of them reach an order.
+
+        Cheap, and it catches the kind of edit that produces a nonsense trade rather
+        than a crash: `hold_duration_hours: 0` divides by zero inside
+        `funding_economics.break_even_apr_pct`, and a negative safety margin would
+        invert the affordable-notional calculation.
+        """
+        problems: List[str] = []
+
+        if not self.symbols_to_monitor:
+            problems.append("symbols_to_monitor is empty")
+        if not isinstance(self.leverage, int) or self.leverage < 1:
+            problems.append(f"leverage must be an integer >= 1 (got {self.leverage!r})")
+        if self.notional_per_position <= 0:
+            problems.append(f"notional_per_position must be > 0 (got {self.notional_per_position!r})")
+        if self.hold_duration_hours <= 0:
+            problems.append(f"hold_duration_hours must be > 0 (got {self.hold_duration_hours!r})")
+        if self.wait_between_cycles_minutes < 0:
+            problems.append(f"wait_between_cycles_minutes must be >= 0 (got {self.wait_between_cycles_minutes!r})")
+        if self.check_interval_seconds <= 0:
+            problems.append(f"check_interval_seconds must be > 0 (got {self.check_interval_seconds!r})")
+        if self.min_net_apr_threshold < 0:
+            problems.append(f"min_net_apr_threshold must be >= 0 (got {self.min_net_apr_threshold!r})")
+        if self.max_spread_pct <= 0:
+            problems.append(f"max_spread_pct must be > 0 (got {self.max_spread_pct!r})")
+        if self.funding_table_refresh_minutes <= 0:
+            problems.append(f"funding_table_refresh_minutes must be > 0 (got {self.funding_table_refresh_minutes!r})")
+        if not 0 < self.capital_safety_margin <= 1:
+            problems.append(f"capital_safety_margin must be in (0, 1] (got {self.capital_safety_margin!r})")
+
+        if problems:
+            raise ConfigError(f"{source}: invalid configuration - " + "; ".join(problems))
+
+    @classmethod
+    def load_from_file(cls, config_file: str) -> 'BotConfig':
+        """Load configuration from JSON file.
+
+        Raises ConfigError on anything missing, unreadable, unknown or out of range.
+        See ConfigError for why this is fatal rather than quietly defaulted.
+        """
         try:
             with open(config_file, 'r') as f:
                 data = json.load(f)
+        except FileNotFoundError as exc:
+            raise ConfigError(
+                f"Config file {config_file} not found. Refusing to start on built-in "
+                f"defaults (3x leverage, 8h hold, 5% APR gate) - they are not the "
+                f"configured strategy."
+            ) from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"Config file {config_file} could not be read: {exc}") from exc
 
-            # Remove comment fields
-            data = {k: v for k, v in data.items() if not k.startswith('comment')}
+        if not isinstance(data, dict):
+            raise ConfigError(f"{config_file}: top level must be a JSON object")
 
-            # Provide defaults
-            defaults = {
-                'symbols_to_monitor': DEFAULT_SYMBOLS,
-                'quote': 'USDT',
-                'leverage': 3,
-                'notional_per_position': 100.0,
-                'hold_duration_hours': 8.0,
-                'wait_between_cycles_minutes': 5.0,
-                'check_interval_seconds': 60,
-                'min_net_apr_threshold': 5.0,
-                'max_spread_pct': 0.15,
-                'enable_stop_loss': True,
-                'funding_table_refresh_minutes': 5.0,
-                'capital_safety_margin': 0.95
-            }
-
-            for key, default_value in defaults.items():
-                if key not in data:
-                    data[key] = default_value
-                    logger.info(f"Using default value for {key}: {default_value}")
-
-            return BotConfig(**data)
-        except FileNotFoundError:
-            logger.warning(f"Config file {config_file} not found, using defaults")
-            return BotConfig(symbols_to_monitor=DEFAULT_SYMBOLS)
-        except Exception as e:
-            logger.error(f"Error loading config: {e}")
-            return BotConfig(symbols_to_monitor=DEFAULT_SYMBOLS)
+        config = cls(**cls._clean(data, config_file))
+        config.validate(config_file)
+        return config
 
     def reload(self, config_file: str) -> bool:
-        """
-        Reload configuration from file, updating this instance.
-        Returns True if reload was successful, False otherwise.
+        """Reload configuration in place. Returns True if the file was applied.
+
+        Non-fatal by design, unlike the initial load: the bot may be holding a live
+        position, and refusing to continue because someone saved a half-edited config
+        is worse than running on the last known-good values.
+
+        The update is all-or-nothing. The candidate is fully built and validated
+        before a single attribute is touched, so a bad edit can never leave the bot
+        running on a half-applied mixture of old and new parameters.
         """
         try:
             with open(config_file, 'r') as f:
                 data = json.load(f)
-
-            # Remove comment fields
-            data = {k: v for k, v in data.items() if not k.startswith('comment')}
-
-            # Provide defaults
-            defaults = {
-                'symbols_to_monitor': DEFAULT_SYMBOLS,
-                'quote': 'USDT',
-                'leverage': 3,
-                'notional_per_position': 100.0,
-                'hold_duration_hours': 8.0,
-                'wait_between_cycles_minutes': 5.0,
-                'check_interval_seconds': 60,
-                'min_net_apr_threshold': 5.0,
-                'max_spread_pct': 0.15,
-                'enable_stop_loss': True,
-                'funding_table_refresh_minutes': 5.0,
-                'capital_safety_margin': 0.95
-            }
-
-            for key, default_value in defaults.items():
-                if key not in data:
-                    data[key] = default_value
-
-            # Update instance attributes
-            changed_params = []
-            for key, new_value in data.items():
-                old_value = getattr(self, key, None)
-                if old_value != new_value:
-                    setattr(self, key, new_value)
-                    changed_params.append(f"{key}: {old_value} → {new_value}")
-
-            if changed_params:
-                logger.info(f"Configuration reloaded with changes:")
-                for change in changed_params:
-                    logger.info(f"  - {change}")
-            else:
-                logger.debug("Configuration reloaded (no changes detected)")
-
-            return True
-        except FileNotFoundError:
-            logger.warning(f"Config file {config_file} not found during reload")
+            if not isinstance(data, dict):
+                raise ConfigError(f"{config_file}: top level must be a JSON object")
+            candidate = BotConfig(**self._clean(data, config_file))
+            candidate.validate(config_file)
+        except (OSError, json.JSONDecodeError, ConfigError, TypeError, ValueError) as exc:
+            logger.error(
+                "Config reload failed (%s). Continuing on the previously loaded "
+                "values, which are unchanged.", exc
+            )
             return False
-        except Exception as e:
-            logger.error(f"Error reloading config: {e}")
-            return False
+
+        changed_params = []
+        for field_def in fields(self):
+            old_value = getattr(self, field_def.name)
+            new_value = getattr(candidate, field_def.name)
+            if old_value != new_value:
+                setattr(self, field_def.name, new_value)
+                changed_params.append(f"{field_def.name}: {old_value} → {new_value}")
+
+        if changed_params:
+            logger.info("Configuration reloaded with changes:")
+            for change in changed_params:
+                logger.info(f"  - {change}")
+        else:
+            logger.debug("Configuration reloaded (no changes detected)")
+
+        return True
 
 
 # ==================== Helper Functions ====================
@@ -412,9 +499,17 @@ def get_avg_mid(
     raise RuntimeError("No usable prices from either venue.")
 
 
-def _calculate_apr(rate: float, periods_per_day: int) -> float:
-    """Convert a per-period funding rate (decimal form) into annualized percentage."""
-    return rate * periods_per_day * 365 * 100.0
+# NOTE on auditing the Lighter interval: funding_economics.audit_constant_interval()
+# exists to re-check a hardcoded cadence against observed settlement timestamps, but the
+# installed Lighter SDK exposes only FundingApi.funding_rates() - current rates, with no
+# history endpoint - so there are no timestamps to audit against from here. The 1h
+# constant rests on the cross-venue comparison documented in
+# funding_economics.CONSTANT_INTERVALS. If Lighter ever ships a funding-history
+# endpoint, wire audit_constant_interval() into startup.
+#
+# `_calculate_apr` was removed: annualisation now goes through
+# funding_economics.annualize(rate, FundingInterval), so a period count can no longer be
+# passed as a bare literal at the call site.
 
 
 def utc_now() -> datetime:
@@ -712,86 +807,72 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
     aster_apr: Optional[float] = None
     lighter_apr: Optional[float] = None
 
-    async def fetch_aster_rate() -> Optional[Tuple[float, int]]:
-        """
-        Fetch Aster funding rate and detect funding interval.
+    async def _aster_interval_hours(sym: str) -> Optional[float]:
+        """Authoritative source: the venue publishes its own cadence."""
+        for row in await aster.get_funding_info():
+            if row.get('symbol') == sym:
+                value = row.get('fundingIntervalHours')
+                return float(value) if value else None
+        return None
 
-        Returns:
-            Tuple of (rate, periods_per_day) or None if failed
+    async def _aster_funding_times(sym: str) -> List[int]:
+        history = await aster.get_funding_rate_history(sym, limit=50)
+        return [int(h['fundingTime']) for h in (history or []) if h.get('fundingTime')]
+
+    async def fetch_aster_rate() -> Optional[Tuple[float, FundingInterval]]:
+        """Fetch the Aster funding rate and RESOLVE its interval.
+
+        Returns (rate_decimal, FundingInterval), or None if either is unavailable.
+
+        The previous implementation read two history records, took the single gap
+        between them as the interval, and fell back to `periods_per_day = 6` on any
+        problem. Both halves of that were wrong in the direction that costs money:
+
+          - Aster runs 1h, 4h and 8h cadences simultaneously across symbols. One gap
+            is enough to be fooled by a single irregular settlement.
+          - Defaulting to 6 periods/day on the 8h symbols - BTC, ETH, SOL, BNB, DOGE,
+            LINK, LTC, XRP, i.e. most of the configured universe - DOUBLES the
+            reported Aster APR, so the worst-understood symbols sort to the top of
+            the opportunity table.
+
+        A symbol whose interval cannot be established is now skipped. Refusing to
+        trade it is strictly better than ranking it on a guess.
         """
         logger.debug(f"fetch_aster_rate: Starting for {symbol}")
+
         try:
-            # First, try to get current funding rate from premium index (more accurate)
+            rate: Optional[float] = None
             try:
                 premium_data = await aster.get_premium_index(symbol)
-                current_rate = float(premium_data.get('lastFundingRate', 0))
-                next_funding_time = int(premium_data.get('nextFundingTime', 0))
+                rate = float(premium_data.get('lastFundingRate', 0))
+                logger.debug(f"fetch_aster_rate: current rate {rate} for {symbol} from premium index")
+            except Exception as premium_err:
+                logger.debug(f"fetch_aster_rate: premium index failed for {symbol}, "
+                             f"falling back to history: {premium_err}")
+                history = await aster.get_funding_rate_history(symbol, limit=1)
+                if not history:
+                    logger.warning(f"fetch_aster_rate: no funding data at all for {symbol}")
+                    return None
+                rate = float(history[0].get('fundingRate', 0))
 
-                logger.debug(
-                    f"fetch_aster_rate: Got CURRENT rate {current_rate} for {symbol} "
-                    f"from premium index (next funding: {next_funding_time})"
+            try:
+                interval = await FUNDING_RESOLVER.resolve_from_api_field(
+                    "aster", symbol, _aster_interval_hours
+                )
+            except IntervalResolutionError as field_err:
+                logger.debug("fetch_aster_rate: fundingInfo unusable for %s (%s); "
+                             "falling back to empirical resolution", symbol, field_err)
+                interval = await FUNDING_RESOLVER.resolve_empirically(
+                    "aster", symbol, _aster_funding_times
                 )
 
-                # Fetch history to detect interval
-                history = await aster.get_funding_rate_history(symbol, limit=2)
-                periods_per_day = 6  # Default: every 4 hours
+            logger.debug("fetch_aster_rate: %s interval %.4gh (%s)",
+                         symbol, interval.hours, interval.source)
+            return (rate, interval)
 
-                if history and len(history) >= 2:
-                    try:
-                        time1 = int(history[0].get('fundingTime', 0))
-                        time2 = int(history[1].get('fundingTime', 0))
-
-                        if time1 and time2:
-                            interval_ms = abs(time1 - time2)
-                            interval_hours = interval_ms / (1000 * 60 * 60)
-
-                            # Calculate periods per day based on interval
-                            if interval_hours > 0:
-                                periods_per_day = round(24 / interval_hours)
-                                logger.debug(
-                                    f"fetch_aster_rate: Detected {interval_hours:.1f}h funding interval "
-                                    f"for {symbol} ({periods_per_day} periods/day)"
-                                )
-                    except Exception as e:
-                        logger.debug(f"fetch_aster_rate: Could not detect interval for {symbol}, using default: {e}")
-
-                return (current_rate, periods_per_day)
-
-            except Exception as premium_err:
-                # Fallback to history if premium index fails
-                logger.debug(f"fetch_aster_rate: Premium index failed for {symbol}, falling back to history: {premium_err}")
-
-                history = await aster.get_funding_rate_history(symbol, limit=2)
-                if not history or len(history) == 0:
-                    logger.warning(f"fetch_aster_rate: No funding history for {symbol}")
-                    return None
-
-                rate = float(history[0].get('fundingRate', 0))
-                logger.debug(f"fetch_aster_rate: Got rate {rate} for {symbol} from history")
-
-                # Detect funding interval from timestamps
-                periods_per_day = 6  # Default: every 4 hours
-                if len(history) >= 2:
-                    try:
-                        time1 = int(history[0].get('fundingTime', 0))
-                        time2 = int(history[1].get('fundingTime', 0))
-
-                        if time1 and time2:
-                            interval_ms = abs(time1 - time2)
-                            interval_hours = interval_ms / (1000 * 60 * 60)
-
-                            # Calculate periods per day based on interval
-                            if interval_hours > 0:
-                                periods_per_day = round(24 / interval_hours)
-                                logger.debug(
-                                    f"fetch_aster_rate: Detected {interval_hours:.1f}h funding interval "
-                                    f"for {symbol} ({periods_per_day} periods/day)"
-                                )
-                    except Exception as e:
-                        logger.debug(f"fetch_aster_rate: Could not detect interval for {symbol}, using default: {e}")
-
-                return (rate, periods_per_day)
-
+        except IntervalResolutionError as exc:
+            logger.warning("Skipping %s: Aster funding interval unresolved (%s)", symbol, exc)
+            return None
         except Exception as exc:
             logger.error("Error fetching Aster funding for %s: %s", symbol, exc, exc_info=True)
             return None
@@ -851,14 +932,16 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
     )
     spread_pct, aster_mid, lighter_mid = spread_data
 
-    # Unpack Aster result (rate, periods_per_day)
+    # Unpack Aster result (rate, resolved FundingInterval). A None here means either
+    # the rate or the interval could not be established - both are disqualifying.
     aster_rate_decimal = None
-    aster_periods_per_day = 6  # Default
+    aster_interval: Optional[FundingInterval] = None
     if aster_result is not None:
-        aster_rate_decimal, aster_periods_per_day = aster_result
+        aster_rate_decimal, aster_interval = aster_result
 
     logger.debug(
-        f"fetch_symbol_funding: Received aster_rate={aster_rate_decimal} ({aster_periods_per_day} periods/day), "
+        f"fetch_symbol_funding: Received aster_rate={aster_rate_decimal} "
+        f"(interval={aster_interval.hours if aster_interval else None}h), "
         f"lighter_rate={lighter_rate_decimal}, spread={spread_pct} for {symbol}"
     )
 
@@ -894,22 +977,22 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
             "lighter_rate": lighter_rate_decimal * 100 if lighter_rate_decimal is not None else None,
         }
 
-    # Aster funding interval varies by symbol (detected dynamically from API)
-    # Lighter funding happens every 8 hours (3 times per day)
-    aster_apr = _calculate_apr(aster_rate_decimal, aster_periods_per_day)
-    # Lighter settles HOURLY -> 24 periods/day, not 3.
+    # Both APRs now come from a resolved FundingInterval rather than a literal.
     #
-    # RESOLVED EMPIRICALLY (not from docs): /api/v1/funding-rates is a cross-venue
-    # endpoint returning binance/bybit/hyperliquid/lighter side by side. Comparing
-    # Lighter against Hyperliquid - whose convention is established beyond doubt as
-    # hourly-decimal - across 98 same-sign common symbols gave a median ratio of
-    # 0.9600, with dozens of pairs at exactly 0.000096 vs 0.00010. Same units, same
-    # period.
+    # Lighter settles HOURLY. RESOLVED EMPIRICALLY (not from docs):
+    # /api/v1/funding-rates is a cross-venue endpoint returning binance/bybit/
+    # hyperliquid/lighter side by side. Comparing Lighter against Hyperliquid - whose
+    # convention is established beyond doubt as hourly-decimal - across 98 same-sign
+    # common symbols gave a median ratio of 0.9600, with dozens of pairs at exactly
+    # 0.000096 vs 0.00010. Same units, same period. So the rate is a DECIMAL and the
+    # cadence is HOURLY; the old `periods_per_day=3` understated every Lighter APR by
+    # exactly 8x and mis-ranked every cross-venue spread the bot evaluated.
     #
-    # So the rate IS a decimal (the *100 inside _calculate_apr is correct) and it is
-    # HOURLY. Using 3 periods/day understated every Lighter APR by exactly 8x, which
-    # systematically mis-ranked every cross-venue spread this bot evaluated.
-    lighter_apr = _calculate_apr(lighter_rate_decimal, 24)
+    # That constant now lives in funding_economics.CONSTANT_INTERVALS, where
+    # audit_constant_interval() re-checks it against observed settlements at startup.
+    lighter_interval = FUNDING_RESOLVER.constant("lighter")
+    aster_apr = annualize(aster_rate_decimal, aster_interval)
+    lighter_apr = annualize(lighter_rate_decimal, lighter_interval)
 
     long_aster_short_lighter = lighter_apr - aster_apr
     long_lighter_short_aster = aster_apr - lighter_apr
@@ -928,9 +1011,12 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
         "available": True,
         "aster_rate": aster_rate_decimal * 100 if aster_rate_decimal is not None else None,
         "aster_apr": aster_apr,
-        "aster_periods_per_day": aster_periods_per_day,
+        "aster_interval_hours": aster_interval.hours,
+        "aster_interval_source": aster_interval.source,
+        "aster_periods_per_day": aster_interval.periods_per_day,
         "lighter_rate": lighter_rate_decimal * 100 if lighter_rate_decimal is not None else None,
         "lighter_apr": lighter_apr,
+        "lighter_interval_hours": lighter_interval.hours,
         "long_exch": long_exch,
         "short_exch": short_exch,
         "net_apr": net_apr,
@@ -939,10 +1025,141 @@ async def fetch_symbol_funding(symbol: str, env: dict, aster: AsterApiManager, c
         "lighter_mid": lighter_mid,
     }
     logger.debug(
-        f"fetch_symbol_funding: Success for {symbol}: net_apr={net_apr:.2f}%, long={long_exch}, short={short_exch}, "
-        f"aster_periods={aster_periods_per_day}/day"
+        f"fetch_symbol_funding: Success for {symbol}: net_apr={net_apr:.2f}%, "
+        f"long={long_exch}, short={short_exch}, "
+        f"aster_interval={aster_interval.hours}h ({aster_interval.source})"
     )
     return result
+
+
+class HedgeVenues:
+    """Builds the two `LegSpec`s that `two_leg.py` drives, for one symbol.
+
+    Open and close both go through this so they cannot drift apart. The close path has
+    to cancel, retry and halt with exactly the same semantics the open path unwinds
+    with; the previous code hand-rolled two copies of that logic and they did not
+    agree - the open path aborted on a rejected leg while the close path printed a
+    warning and returned success.
+
+    All venue coupling lives here. `two_leg.py` imports no exchange client at all.
+    """
+
+    def __init__(
+        self,
+        env: dict,
+        aster: AsterApiManager,
+        signer: lighter.SignerClient,
+        order_api,
+        account_api,
+        symbol: str,
+        l_market_id: int,
+        l_price_tick: float,
+        l_amount_tick: float,
+        aster_step_size: float,
+        cross_ticks: int = 100,
+    ):
+        self.env = env
+        self.aster = aster
+        self.signer = signer
+        self.order_api = order_api
+        self.account_api = account_api
+        self.symbol = symbol
+        self.symbol_clean = symbol.replace("USDT", "")
+        self.l_market_id = l_market_id
+        self.l_price_tick = l_price_tick
+        self.l_amount_tick = l_amount_tick
+        self.aster_step_size = aster_step_size
+        self.cross_ticks = cross_ticks
+
+    # ---- Lighter -------------------------------------------------------
+    async def _fresh_lighter_ref(self, side: str) -> Optional[float]:
+        """Best bid/ask at the moment of use.
+
+        Re-fetched rather than captured once: an unwind can run many seconds and
+        several retries after the opening quotes were taken, and crossing the spread
+        against a stale reference is how a "close" order rests instead of filling.
+        """
+        bid, ask = await lighter_client.get_lighter_best_bid_ask(
+            self.order_api, self.symbol_clean, self.l_market_id
+        )
+        return (ask or bid) if side == "buy" else (bid or ask)
+
+    def lighter_leg(self, side: str, intent_qty: float) -> LegSpec:
+        async def submit(qty: float):
+            ref = await self._fresh_lighter_ref(side)
+            if ref is None:
+                raise RuntimeError(
+                    f"Lighter: no reference price for {side} on {self.symbol_clean}"
+                )
+            return await lighter_client.lighter_place_aggressive_order(
+                self.signer, self.l_market_id, self.l_price_tick, self.l_amount_tick,
+                side, _floor_to_tick(qty, self.l_amount_tick), ref,
+                cross_ticks=self.cross_ticks,
+            )
+
+        async def read_position() -> float:
+            return await lighter_client.get_lighter_open_size(
+                self.account_api, self.env["ACCOUNT_INDEX"], self.l_market_id,
+                symbol=self.symbol_clean,
+            )
+
+        async def close_market(qty: float, close_side: str):
+            ref = await self._fresh_lighter_ref(close_side)
+            if ref is None:
+                raise RuntimeError(f"Lighter: no reference price to close {self.symbol_clean}")
+            # Ceil, not floor: the order is reduce-only, so rounding up closes the
+            # whole residual, while rounding down leaves sub-tick dust the unwind loop
+            # can never clear - driving it to a spurious halt.
+            return await lighter_client.lighter_close_position(
+                self.signer, self.l_market_id, self.l_price_tick, self.l_amount_tick,
+                close_side, _ceil_to_tick(qty, self.l_amount_tick), ref,
+                cross_ticks=self.cross_ticks,
+            )
+
+        async def cancel_open() -> int:
+            return await lighter_client.lighter_cancel_open_orders(
+                self.signer, self.order_api, self.env["ACCOUNT_INDEX"], self.l_market_id
+            )
+
+        return LegSpec(
+            name="Lighter", symbol=self.symbol_clean, side=side, intent_qty=intent_qty,
+            submit=submit, read_position=read_position, close_market=close_market,
+            cancel_open=cancel_open, amount_tick=self.l_amount_tick,
+            # zk batch inclusion takes ~3s; reading sooner reports a false zero and
+            # makes verify_fill call a good leg REJECTED.
+            settle_delay_s=3.0,
+        )
+
+    # ---- Aster ---------------------------------------------------------
+    def aster_leg(self, side: str, intent_qty: float) -> LegSpec:
+        async def submit(qty: float):
+            return await self.aster.place_perp_market_order(
+                self.symbol, str(_floor_to_tick(qty, self.aster_step_size)),
+                'BUY' if side == "buy" else 'SELL',
+            )
+
+        async def read_position() -> float:
+            account = await self.aster.get_perp_account_info()
+            for pos in account.get('positions', []) or []:
+                if pos.get('symbol') == self.symbol:
+                    return float(pos.get('positionAmt', 0) or 0)
+            return 0.0
+
+        async def close_market(qty: float, close_side: str):
+            return await self.aster.close_perp_position(
+                self.symbol, str(_ceil_to_tick(qty, self.aster_step_size)),
+                'BUY' if close_side == "buy" else 'SELL',
+            )
+
+        async def cancel_open() -> int:
+            return await self.aster.cancel_all_perp_orders(self.symbol)
+
+        return LegSpec(
+            name="Aster", symbol=self.symbol, side=side, intent_qty=intent_qty,
+            submit=submit, read_position=read_position, close_market=close_market,
+            cancel_open=cancel_open, amount_tick=self.aster_step_size,
+            settle_delay_s=1.0,
+        )
 
 
 async def open_delta_neutral_position(
@@ -1005,8 +1222,26 @@ async def open_delta_neutral_position(
         await api_client.close()
         raise
 
-    # Configure leverage
-    await configure_leverage(leverage, env, aster, signer, symbol, l_market_id, verify=True)
+    # Configure leverage on BOTH venues, and refuse to trade if either failed.
+    #
+    # The return value used to be discarded. Opening anyway means the margin actually
+    # applied is whatever each venue happened to have set from a previous cycle, so the
+    # liquidation distance the stop-loss is calculated against (100/leverage) is not the
+    # liquidation distance in force. Sizing is derived from `leverage` too, so a failed
+    # set on one side silently produces an asymmetric hedge.
+    aster_lev_ok, lighter_lev_ok = await configure_leverage(
+        leverage, env, aster, signer, symbol, l_market_id, verify=True
+    )
+    if not (aster_lev_ok and lighter_lev_ok):
+        failed = [name for name, ok in (("Aster", aster_lev_ok), ("Lighter", lighter_lev_ok))
+                  if not ok]
+        await signer.close()
+        await api_client.close()
+        raise RuntimeError(
+            f"Leverage configuration failed on {', '.join(failed)}. Refusing to open: "
+            f"the applied margin would not match the {leverage}x this position is sized "
+            f"and stop-lossed for."
+        )
 
     avg_mid = get_avg_mid(lighter_bid, lighter_ask, aster_bid, aster_ask)
     size_base = compute_base_size_from_quote(avg_mid, float(notional_quote))
@@ -1051,144 +1286,83 @@ async def open_delta_neutral_position(
         await signer.close()
         await api_client.close()
         raise RuntimeError("Long and short exchanges cannot be identical.")
-
-    tasks = []
-    leg_names: List[str] = []
-
-    # Place orders on both exchanges
-    if long_leg == "lighter":
-        ref_price = lighter_ask if lighter_ask else lighter_bid
-        if ref_price is None:
-            raise RuntimeError("Lighter: No reference price available for long leg.")
-        tasks.append(
-            lighter_client.lighter_place_aggressive_order(
-                signer,
-                l_market_id,
-                l_price_tick,
-                l_amount_tick,
-                "buy",
-                size_base,
-                ref_price,
-                cross_ticks=cross_ticks,
-            )
-        )
-        leg_names.append("Lighter (LONG)")
-    elif long_leg == "aster":
-        tasks.append(
-            aster.place_perp_market_order(symbol, str(size_base), 'BUY')
-        )
-        leg_names.append("Aster (LONG)")
-    else:
-        raise RuntimeError(f"Unsupported long exchange: {long_exchange}")
-
-    if short_leg == "lighter":
-        ref_price = lighter_bid if lighter_bid else lighter_ask
-        if ref_price is None:
-            raise RuntimeError("Lighter: No reference price available for short leg.")
-        tasks.append(
-            lighter_client.lighter_place_aggressive_order(
-                signer,
-                l_market_id,
-                l_price_tick,
-                l_amount_tick,
-                "sell",
-                size_base,
-                ref_price,
-                cross_ticks=cross_ticks,
-            )
-        )
-        leg_names.append("Lighter (SHORT)")
-    elif short_leg == "aster":
-        tasks.append(
-            aster.place_perp_market_order(symbol, str(size_base), 'SELL')
-        )
-        leg_names.append("Aster (SHORT)")
-    else:
+    if {long_leg, short_leg} != {"lighter", "aster"}:
         await signer.close()
         await api_client.close()
-        raise RuntimeError(f"Unsupported short exchange: {short_exchange}")
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Classify each leg through the canonical normaliser rather than testing
-    # `isinstance(res, Exception)`.
-    #
-    # That test was the core defect of this bot: Lighter's
-    # lighter_place_aggressive_order returns None on error and its close helper
-    # returns False, neither of which is an Exception. A rejected Lighter order
-    # therefore sailed through as a success and printed "Both orders placed
-    # successfully" while only the Aster leg was live - a fully naked position,
-    # held for the entire hold_duration, reported as hedged.
-    #
-    # classify_submission also refuses to call anything FILLED on the strength of a
-    # submission response alone; the verification block below is what confirms a
-    # fill. "Order accepted" is not "order filled".
-    leg_results = [
-        classify_submission(
-            leg_names[idx], res,
-            intent_qty=float(size_base), symbol=symbol, side="open",
+        raise RuntimeError(
+            f"Unsupported venue pair (long={long_exchange}, short={short_exchange}). "
+            f"This bot trades Lighter against Aster only."
         )
-        for idx, res in enumerate(results)
-    ]
-    rejected = [(leg_names[i], r) for i, r in enumerate(leg_results)
-                if r.status is LegStatus.REJECTED]
 
-    if rejected:
-        print(f"\n{Colors.RED}{Colors.BOLD}❌ ERROR: One or more open orders failed!{Colors.RESET}")
-        for name, r in rejected:
-            print(f"   {Colors.RED}- {name}: {r.error}{Colors.RESET}")
-        maybe_live = [leg_names[i] for i, r in enumerate(leg_results)
-                      if r.status is not LegStatus.REJECTED]
-        if maybe_live:
-            print(f"\n{Colors.YELLOW}{Colors.BOLD}⚠️  CRITICAL: naked leg risk!{Colors.RESET}")
-            print(f"   {Colors.YELLOW}Possibly live on: {', '.join(maybe_live)}{Colors.RESET}")
-            print(f"   {Colors.YELLOW}These legs were ACCEPTED and may be filled. "
-                  f"Verify and flatten them on the venue before restarting.{Colors.RESET}")
-        await signer.close()
-        await api_client.close()
-        raise RuntimeError("Delta-neutral order placement failed on at least one exchange.")
+    account_api = lighter.AccountApi(api_client)
+    lighter_side = "buy" if long_leg == "lighter" else "sell"
+    aster_side = "sell" if lighter_side == "buy" else "buy"
 
-    print(f"{Colors.GREEN}✓ Both orders accepted (fills verified below){Colors.RESET}")
-    logger.info("Opened hedge: size_base=%s %s. Legs placed concurrently.", size_base, symbol_clean)
-
-    await asyncio.sleep(2)  # allow exchanges time to process
-
-    # Verify positions
-    print(f"\n{Colors.CYAN}Verifying positions...{Colors.RESET}")
-
-    try:
-        # Verify Aster position
-        aster_account = await aster.get_perp_account_info()
-        aster_positions = aster_account.get('positions', [])
-        aster_size = 0.0
-        for pos in aster_positions:
-            if pos.get('symbol') == symbol:
-                aster_size = float(pos.get('positionAmt', 0))
-                break
-        aster_color = Colors.GREEN if abs(aster_size) > 0.0001 else Colors.YELLOW
-        print(f"  {aster_color}Aster position:   {aster_size:+.6f} {symbol_clean}{Colors.RESET}")
-    except Exception as e:
-        logger.warning(f"Could not verify Aster position: {e}")
-        print(f"  {Colors.YELLOW}Aster position:   Unable to verify{Colors.RESET}")
-
-    try:
-        # Verify Lighter position
-        account_api = lighter.AccountApi(api_client)
-        lighter_size = await lighter_client.get_lighter_open_size(account_api, env["ACCOUNT_INDEX"], l_market_id, symbol=symbol_clean)
-        lighter_color = Colors.GREEN if abs(lighter_size) > 0.0001 else Colors.YELLOW
-        print(f"  {lighter_color}Lighter position: {lighter_size:+.6f} {symbol_clean}{Colors.RESET}")
-    except Exception as e:
-        logger.warning(f"Could not verify Lighter position: {e}")
-        print(f"  {Colors.YELLOW}Lighter position: Unable to verify{Colors.RESET}")
-
-    print(
-        f"\n{Colors.GREEN}{Colors.BOLD}✓ Hedge opened successfully!{Colors.RESET}\n"
-        f"  {Colors.CYAN}Total exposure: {Colors.BOLD}{size_base:.6f} {symbol_clean}{Colors.RESET}{Colors.CYAN} on each exchange{Colors.RESET}\n"
-        f"  {Colors.CYAN}Delta-neutral: {Colors.BOLD}LONG {long_exchange.capitalize()}{Colors.RESET}{Colors.CYAN}, {Colors.BOLD}SHORT {short_exchange.capitalize()}{Colors.RESET}\n"
+    venues = HedgeVenues(
+        env, aster, signer, order_api, account_api, symbol,
+        l_market_id, l_price_tick, l_amount_tick, aster_step_size,
+        cross_ticks=cross_ticks,
     )
 
-    await signer.close()
-    await api_client.close()
+    # Lighter is the PILOT because its orders are GOOD_TILL_TIME and can rest silently
+    # on the book; Aster's are market orders that resolve immediately. Submit the leg
+    # that can leave a surprise first, cancel it, verify it, and only then commit the
+    # other side - sized from what actually filled, never from the original intent.
+    pilot = venues.lighter_leg(lighter_side, size_base)
+    hedge = venues.aster_leg(aster_side, size_base)
+
+    print(f"\n{Colors.CYAN}Opening hedge sequentially: "
+          f"{Colors.BOLD}Lighter {lighter_side.upper()}{Colors.RESET}{Colors.CYAN} (pilot) "
+          f"then {Colors.BOLD}Aster {aster_side.upper()}{Colors.RESET}{Colors.CYAN} "
+          f"(hedge), {size_base:.6f} {symbol_clean}{Colors.RESET}")
+
+    try:
+        outcome = await execute_two_leg(
+            pilot, hedge,
+            min_notional_qty=max(l_amount_tick, aster_step_size) * 10,
+        )
+    finally:
+        await signer.close()
+        await api_client.close()
+
+    for note in outcome.notes:
+        logger.info("two-leg: %s", note)
+        print(f"  {Colors.GRAY}- {note}{Colors.RESET}")
+
+    if not outcome.ok:
+        print(f"\n{Colors.RED}{Colors.BOLD}❌ Hedge NOT opened: {outcome.reason}{Colors.RESET}")
+        for leg in (outcome.pilot, outcome.hedge):
+            if leg is not None:
+                print(f"   {Colors.GRAY}{leg.venue}: status={leg.status.value} "
+                      f"filled={leg.filled_qty:.8g} error={leg.error}{Colors.RESET}")
+        if outcome.halted:
+            print(f"\n{Colors.RED}{Colors.BOLD}⚠️  HALTED: an unwind did not complete. "
+                  f"Real unhedged exposure may exist. Check BOTH venues manually, then "
+                  f"remove halt.json to resume.{Colors.RESET}\n")
+        raise RuntimeError(f"Delta-neutral open failed: {outcome.reason}")
+
+    # hedged_qty is the size CONFIRMED on both venues. Everything downstream - the
+    # monitor's position value, the stop-loss percentage, the close - keys off this,
+    # so it must never be the requested size.
+    filled_base = outcome.hedged_qty
+    filled_notional = filled_base * avg_mid
+
+    print(
+        f"\n{Colors.GREEN}{Colors.BOLD}✓ Hedge opened and verified on both venues{Colors.RESET}\n"
+        f"  {Colors.CYAN}Confirmed size: {Colors.BOLD}{filled_base:.6f} {symbol_clean}"
+        f"{Colors.RESET}{Colors.CYAN} (~${filled_notional:,.2f}) on each exchange{Colors.RESET}\n"
+        f"  {Colors.CYAN}Delta-neutral: {Colors.BOLD}LONG {long_exchange.capitalize()}"
+        f"{Colors.RESET}{Colors.CYAN}, {Colors.BOLD}SHORT {short_exchange.capitalize()}"
+        f"{Colors.RESET}\n"
+    )
+    if abs(filled_base - size_base) > 1e-12:
+        logger.warning(
+            "Hedge filled %.10g of a requested %.10g %s (%.2f%%); downstream sizing "
+            "uses the filled amount.",
+            filled_base, size_base, symbol_clean,
+            (filled_base / size_base * 100.0) if size_base else 0.0,
+        )
+    logger.info("Opened hedge: confirmed %.10g %s on both venues", filled_base, symbol_clean)
 
     return {
         "lighter_market_id": l_market_id,
@@ -1199,8 +1373,12 @@ async def open_delta_neutral_position(
         "aster_ask": aster_ask,
         "lighter_bid": lighter_bid,
         "lighter_ask": lighter_ask,
-        "size_base": size_base,
+        "size_base": filled_base,
+        "requested_size_base": size_base,
+        "filled_notional": filled_notional,
         "avg_mid": avg_mid,
+        "lighter_side": lighter_side,
+        "aster_side": aster_side,
     }
 
 
@@ -1227,7 +1405,12 @@ async def close_delta_neutral_position(
 
     symbol_clean = symbol.replace("USDT", "")
     l_market_id, l_price_tick, l_amount_tick = await lighter_client.get_lighter_market_details(order_api, symbol_clean)
-    lighter_bid, lighter_ask = await lighter_client.get_lighter_best_bid_ask(order_api, symbol_clean, l_market_id)
+
+    # No bid/ask fetch here any more: HedgeVenues re-reads the book at the moment each
+    # close order is actually sent, which matters because an unwind can retry several
+    # times over tens of seconds.
+    aster_lot_size_filter = await aster.get_perp_symbol_filter(symbol, 'LOT_SIZE')
+    aster_step_size = float(aster_lot_size_filter.get('stepSize', 0.001)) if aster_lot_size_filter else 0.001
 
     print(f"\n{Colors.RED}{Colors.BOLD}┌{'─' * 66}┐{Colors.RESET}")
     print(f"{Colors.RED}{Colors.BOLD}│{'Closing Delta-Neutral Hedge':^66}│{Colors.RESET}")
@@ -1265,103 +1448,90 @@ async def close_delta_neutral_position(
     print(f"  {lighter_color}Lighter position: {lighter_size:+.6f} {symbol_clean}{Colors.RESET}")
 
     print(f"\n{Colors.CYAN}Closing positions on both exchanges...{Colors.RESET}")
-    tasks = []
 
-    # Close Lighter position
+    # Close through the same unwind primitive the open path uses when it has to back
+    # out, instead of a hand-rolled send-and-hope.
+    #
+    # unwind_leg cancels resting orders FIRST, re-reads the position, closes whatever
+    # residual is actually there, and repeats before writing a halt sentinel. That
+    # ordering is the point: the Lighter close is a GOOD_TILL_TIME reduce-only order,
+    # so a single unverified send can sit on the book and fill much later - after the
+    # cycle has been recorded complete and the position forgotten.
+    venues = HedgeVenues(
+        env, aster, signer, order_api, account_api, symbol,
+        l_market_id, l_price_tick, l_amount_tick, aster_step_size,
+        cross_ticks=cross_ticks,
+    )
+    lighter_leg = venues.lighter_leg(
+        "buy" if lighter_size < 0 else "sell", max(abs(lighter_size), l_amount_tick)
+    )
+    aster_leg = venues.aster_leg(
+        "buy" if aster_size < 0 else "sell", max(abs(aster_size), aster_step_size)
+    )
+
+    to_unwind: List[LegSpec] = []
     if abs(lighter_size) > l_amount_tick:
-        lighter_close_side = "sell" if lighter_size > 0 else "buy"
-        ref_price = lighter_bid if lighter_close_side == "sell" else lighter_ask
-        if ref_price:
-            tasks.append(
-                lighter_client.lighter_close_position(
-                    signer,
-                    l_market_id,
-                    l_price_tick,
-                    l_amount_tick,
-                    lighter_close_side,
-                    abs(lighter_size),
-                    ref_price,
-                    cross_ticks=cross_ticks,
-                )
-            )
-        else:
-            logger.warning("Lighter: No reference price available to close position.")
-            print(f"  {Colors.YELLOW}Lighter: No reference price available, cannot send close order.{Colors.RESET}")
+        to_unwind.append(lighter_leg)
     else:
-        print(f"  {Colors.GRAY}Lighter: Position already flat or below minimum tick.{Colors.RESET}")
-
-    # Close Aster position
+        print(f"  {Colors.GRAY}Lighter: already flat (below one amount tick).{Colors.RESET}")
     if abs(aster_size) > 0.0001:
-        aster_close_side = 'BUY' if aster_size < 0 else 'SELL'
-        tasks.append(
-            aster.close_perp_position(symbol, str(abs(aster_size)), aster_close_side)
+        to_unwind.append(aster_leg)
+    else:
+        print(f"  {Colors.GRAY}Aster: already flat.{Colors.RESET}")
+
+    try:
+        if not to_unwind:
+            print(f"{Colors.GREEN}✓ Nothing to close - both venues already flat.{Colors.RESET}")
+            return
+
+        # Unwound concurrently: closing both together keeps the hedge balanced for as
+        # long as possible. Each leg writes its own halt sentinel on exhaustion.
+        results = await asyncio.gather(
+            *(unwind_leg(leg, baseline_signed_qty=0.0) for leg in to_unwind),
+            return_exceptions=True,
         )
 
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        # Same normalisation as the open path: `isinstance(res, Exception)` misses
-        # Lighter's None/False failure returns, so a close that never happened was
-        # reported as sent.
-        close_results = [
-            classify_submission(f"close-leg-{i}", res, intent_qty=0.0,
-                                symbol=symbol, side="close")
-            for i, res in enumerate(results)
-        ]
-        rejected = [r for r in close_results if r.status is LegStatus.REJECTED]
-        if rejected:
-            print(f"\n{Colors.RED}{Colors.BOLD}❌ ERROR: One or more close orders failed!{Colors.RESET}")
-            for r in rejected:
-                print(f"   {Colors.RED}- {r.venue}: {r.error}{Colors.RESET}")
-            print(f"\n{Colors.YELLOW}{Colors.BOLD}⚠️  WARNING: Please verify positions manually.{Colors.RESET}")
-            await signer.close()
-            await api_client.close()
-            raise RuntimeError("Failed to close positions on one or more venues.")
+        failures: List[str] = []
+        for leg, result in zip(to_unwind, results):
+            if isinstance(result, BaseException):
+                failures.append(f"{leg.name}: {type(result).__name__}: {result}")
+            elif result is not True:
+                failures.append(f"{leg.name}: residual position could not be flattened")
 
-    print(f"{Colors.GREEN}✓ Close orders accepted (closure verified below){Colors.RESET}")
+        if failures:
+            # A close that did not complete must NOT return normally. It used to print
+            # a warning and fall through, after which the caller recorded the cycle as
+            # "success" and cleared current_position - leaving a live leg with no
+            # monitoring, no stop-loss, and no record anywhere that it existed.
+            print(f"\n{Colors.RED}{Colors.BOLD}❌ CLOSE INCOMPLETE{Colors.RESET}")
+            for failure in failures:
+                print(f"   {Colors.RED}- {failure}{Colors.RESET}")
+            print(f"\n{Colors.YELLOW}A halt sentinel has been written. The bot will "
+                  f"refuse to trade until BOTH venues are checked manually and "
+                  f"halt.json is removed.{Colors.RESET}\n")
+            raise RuntimeError(f"Close incomplete for {symbol}: " + "; ".join(failures))
 
-    await asyncio.sleep(2)
+        # Final explicit read, for the operator record rather than for the decision -
+        # unwind_leg has already established flatness within tolerance.
+        print(f"\n{Colors.CYAN}Verifying closure...{Colors.RESET}")
+        aster_size_after = await aster_leg.read_position()
+        print(f"  {Colors.GREEN if abs(aster_size_after) < 0.0001 else Colors.RED}"
+              f"Aster position:   {aster_size_after:+.6f} {symbol_clean}{Colors.RESET}")
+        try:
+            lighter_size_after = await lighter_leg.read_position()
+        except lighter_client.PositionFetchError as exc:
+            print(f"\n{Colors.YELLOW}Closure was confirmed by the unwind, but the final "
+                  f"Lighter read failed ({exc}). Treating the unwind result as "
+                  f"authoritative.{Colors.RESET}")
+        else:
+            print(f"  {Colors.GREEN if abs(lighter_size_after) < l_amount_tick else Colors.RED}"
+                  f"Lighter position: {lighter_size_after:+.6f} {symbol_clean}{Colors.RESET}")
 
-    print(f"\n{Colors.CYAN}Verifying closure...{Colors.RESET}")
-    # Re-check positions
-    aster_account_after = await aster.get_perp_account_info()
-    aster_positions_after = aster_account_after.get('positions', [])
-    aster_size_after = 0.0
-    for pos in aster_positions_after:
-        if pos.get('symbol') == symbol:
-            aster_size_after = float(pos.get('positionAmt', 0))
-            break
-    aster_after_color = Colors.GREEN if abs(aster_size_after) < 0.0001 else Colors.RED
-    print(f"  {aster_after_color}Aster position:  {aster_size_after:+.6f} {symbol_clean}{Colors.RESET}")
-
-    # Same rule as the pre-close read: an unreadable position is NOT a closed one.
-    # Swallowing this into 0.0 is what produced "Hedge closed successfully on both
-    # exchanges" while the Lighter leg was still live.
-    try:
-        lighter_size_after = await lighter_client.get_lighter_open_size(account_api, env["ACCOUNT_INDEX"], l_market_id)
-    except lighter_client.PositionFetchError as e:
-        print(f"\n{Colors.RED}{Colors.BOLD}CANNOT VERIFY CLOSURE: Lighter position read failed "
-              f"({e}).{Colors.RESET}")
-        print(f"  {Colors.YELLOW}Close orders were SENT but their effect is unverified. "
-              f"Do NOT assume this position is closed - check Lighter manually.{Colors.RESET}\n")
-        raise
-    lighter_after_color = Colors.GREEN if abs(lighter_size_after) < l_amount_tick else Colors.RED
-    print(f"  {lighter_after_color}Lighter position: {lighter_size_after:+.6f} {symbol_clean}{Colors.RESET}")
-
-    aster_closed = abs(aster_size_after) < 0.0001
-    lighter_closed = abs(lighter_size_after) < l_amount_tick
-
-    if aster_closed and lighter_closed:
-        print(f"\n{Colors.GREEN}{Colors.BOLD}✓ Hedge closed successfully on both exchanges!{Colors.RESET}")
-    else:
-        print(f"\n{Colors.YELLOW}{Colors.BOLD}⚠️  WARNING: One or more positions not fully closed.{Colors.RESET}")
-        if not aster_closed:
-            print(f"  {Colors.RED}Aster position remaining: {aster_size_after:+.6f} {symbol_clean}{Colors.RESET}")
-        if not lighter_closed:
-            print(f"  {Colors.RED}Lighter position remaining: {lighter_size_after:+.6f} {symbol_clean}{Colors.RESET}")
-        print(f"  {Colors.YELLOW}Please check both exchanges manually.{Colors.RESET}\n")
-
-    await signer.close()
-    await api_client.close()
+        print(f"\n{Colors.GREEN}{Colors.BOLD}✓ Hedge closed and verified flat on both "
+              f"exchanges{Colors.RESET}")
+    finally:
+        await signer.close()
+        await api_client.close()
 
 
 class StateManager:
@@ -1669,6 +1839,119 @@ def calculate_affordable_notional(
         return affordable, True
 
 
+def build_cost_model(config: BotConfig) -> TradeCostModel:
+    """Round-trip cost model for one Aster/Lighter cycle.
+
+    Taker fees come from `funding_economics.VERIFIED_TAKER_BPS` so there is exactly one
+    place where a fee number lives: Aster 4.0bps, Lighter genuinely 0.0 on the standard
+    account. With `slippage_bps_per_leg = 0` this reproduces the 0.080% round trip the
+    bot has always assumed, so nothing changes until slippage is calibrated.
+    """
+    slip = float(config.slippage_bps_per_leg)
+    return TradeCostModel(legs=(
+        VenueCosts("aster", VERIFIED_TAKER_BPS["aster"], slip, source="verified"),
+        VenueCosts("lighter", VERIFIED_TAKER_BPS["lighter"], slip, source="verified"),
+    ))
+
+
+async def record_cycle_result(
+    state_mgr: 'StateManager',
+    env: dict,
+    aster: AsterApiManager,
+    config: BotConfig,
+    position: dict,
+    status: str,
+    extra: Optional[Dict[str, object]] = None,
+) -> Optional[float]:
+    """Append a finished cycle and fold its realised PnL into cumulative stats.
+
+    Shared by the hold-expiry close and the stop-loss close. This measurement used to
+    exist only on the hold-expiry path, so every stop-loss cycle - the ones that lose
+    money more or less by definition - incremented `failed_cycles` but contributed
+    nothing to `total_realized_pnl`. The "cumulative realised PnL is NEGATIVE" warning
+    was therefore evaluated over a sample with the losses filtered out, which is the
+    one bias that makes such a warning useless.
+
+    Realised PnL is measured as total capital after minus total capital before. That
+    captures funding, fees and slippage together, with no cost model to be wrong about.
+    """
+    stats = state_mgr.state["cumulative_stats"]
+    cap_before = position.get("capital_at_open")
+    cycle_pnl: Optional[float] = None
+
+    try:
+        if await update_capital_status(env, aster, state_mgr, config):
+            cap_now = state_mgr.state["capital_status"].get("total_capital")
+            if cap_before is not None and cap_now:
+                cycle_pnl = float(cap_now) - float(cap_before)
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning("Could not measure realised cycle PnL: %s", exc)
+
+    notional = float(position.get("actual_notional", 0.0) or 0.0)
+    est_fees = notional * build_cost_model(config).roundtrip_pct() / 100.0
+
+    hold_hours = 0.0
+    try:
+        opened = from_iso_z(position["opened_at"])
+        hold_hours = max(0.0, (utc_now() - opened).total_seconds() / 3600.0)
+    except Exception:                                           # noqa: BLE001
+        pass
+
+    entry: Dict[str, object] = {
+        "symbol": position.get("symbol"),
+        "opened_at": position.get("opened_at"),
+        "closed_at": utc_now_iso(),
+        "expected_net_apr": position.get("expected_net_apr", 0.0),
+        "notional": notional,
+        "hold_hours": round(hold_hours, 4),
+        "realized_pnl": cycle_pnl,
+        "estimated_fees": est_fees,
+        "status": status,
+    }
+    if extra:
+        entry.update(extra)
+    state_mgr.state["completed_cycles"].append(entry)
+
+    stats["total_cycles"] = stats.get("total_cycles", 0) + 1
+    if status == "success":
+        stats["successful_cycles"] = stats.get("successful_cycles", 0) + 1
+    else:
+        stats["failed_cycles"] = stats.get("failed_cycles", 0) + 1
+    stats["total_fees_paid"] = stats.get("total_fees_paid", 0.0) + est_fees
+    stats["total_volume_traded"] = stats.get("total_volume_traded", 0.0) + notional
+    stats["total_hold_time_hours"] = stats.get("total_hold_time_hours", 0.0) + hold_hours
+
+    symbol = str(position.get("symbol") or "UNKNOWN")
+    by_symbol = stats.setdefault("by_symbol", {})
+    sym_stats = by_symbol.setdefault(symbol, {"cycles": 0, "realized_pnl": 0.0})
+    sym_stats["cycles"] += 1
+
+    if cycle_pnl is not None:
+        stats["total_realized_pnl"] = stats.get("total_realized_pnl", 0.0) + cycle_pnl
+        stats["best_cycle_pnl"] = max(stats.get("best_cycle_pnl", 0.0), cycle_pnl)
+        stats["worst_cycle_pnl"] = min(stats.get("worst_cycle_pnl", 0.0), cycle_pnl)
+        sym_stats["realized_pnl"] = sym_stats.get("realized_pnl", 0.0) + cycle_pnl
+
+        pnl_color = Colors.GREEN if cycle_pnl >= 0 else Colors.RED
+        logger.info(
+            f"Cycle realised PnL ({status}): {pnl_color}${cycle_pnl:+.4f}{Colors.RESET} "
+            f"| cumulative: ${stats['total_realized_pnl']:+.4f} over "
+            f"{stats['total_cycles']} cycle(s)"
+        )
+        if stats["total_realized_pnl"] < 0 and stats["total_cycles"] >= 3:
+            logger.warning(
+                f"{Colors.YELLOW}Cumulative realised PnL is NEGATIVE "
+                f"(${stats['total_realized_pnl']:+.4f} over {stats['total_cycles']} "
+                f"cycles). The configured threshold may not be clearing round-trip "
+                f"costs.{Colors.RESET}"
+            )
+    else:
+        logger.warning("Cycle PnL unmeasured - capital snapshot unavailable.")
+
+    state_mgr.save()
+    return cycle_pnl
+
+
 def format_price(price: Optional[float]) -> str:
     """
     Format price with appropriate precision based on magnitude.
@@ -1697,21 +1980,45 @@ def display_funding_table(available: List[dict], unavailable: List[dict], curren
 
     if available:
         print(f"{Colors.GREEN}Available Opportunities (Top {min(limit, len(available))} by Net APR):{Colors.RESET}\n")
-        print(f"{'Symbol':<10} {'Net APR':<10} {'Long':<8} {'Short':<8} {'Aster APR':<11} {'Lighter APR':<13} {'Aster Mid':<15} {'Lighter Mid':<15} {'Spread':<10}")
+        # Break-even and margin are shown per row so a rejected opportunity explains
+        # itself. A bare gross APR cannot: whether 45% is good depends entirely on the
+        # hold length and the round trip, and those are what the operator needs to see
+        # when the bot declines to trade for hours at a time.
+        print(f"{'Symbol':<10} {'Net APR':<10} {'Exp APR':<10} {'BrkEven':<9} {'Margin':<8} "
+              f"{'Net $':<10} {'Long':<8} {'Short':<8} {'Ast APR':<10} {'Lgt APR':<10} "
+              f"{'Ivl':<6} {'Spread':<9} {'Verdict':<8}")
         print(f"{'-' * 150}")
 
-        for i, r in enumerate(available[:limit]):
+        for r in available[:limit]:
             marker = f"{Colors.CYAN}→{Colors.RESET}" if r['symbol'] == current_symbol else " "
             color = Colors.GREEN if r['net_apr'] >= 10 else Colors.YELLOW if r['net_apr'] >= 5 else Colors.RESET
             spread_str = f"{r['spread_pct']:.3f}%" if r.get('spread_pct') is not None else "N/A"
+            interval_str = (f"{r['aster_interval_hours']:.0f}h"
+                            if r.get('aster_interval_hours') else "?")
 
-            aster_mid_str = format_price(r.get('aster_mid'))
-            lighter_mid_str = format_price(r.get('lighter_mid'))
+            decision = r.get('decision')
+            if decision is not None:
+                verdict = (f"{Colors.GREEN}ACCEPT{Colors.RESET}" if decision.accept
+                           else f"{Colors.GRAY}reject{Colors.RESET}")
+                exp_str = f"{decision.expected_apr_pct:>8.2f}%"
+                be_str = f"{decision.break_even_apr_pct:>7.2f}%"
+                margin_str = f"{decision.margin_ratio:>6.2f}x"
+                net_str = f"${decision.expected_net_usd:>+8.2f}"
+            else:
+                verdict, exp_str, be_str, margin_str, net_str = "-", " " * 9, " " * 8, " " * 7, " " * 9
 
             print(f"{marker} {r['symbol']:<8} {color}{r['net_apr']:>8.2f}%{Colors.RESET} "
+                  f"{exp_str:<10} {be_str:<9} {margin_str:<8} {net_str:<10} "
                   f"{r['long_exch']:<8} {r['short_exch']:<8} "
-                  f"{r['aster_apr']:>9.2f}% {r['lighter_apr']:>11.2f}% "
-                  f"{aster_mid_str:<15} {lighter_mid_str:<15} {spread_str:<10}")
+                  f"{r['aster_apr']:>8.2f}% {r['lighter_apr']:>8.2f}% "
+                  f"{interval_str:<6} {spread_str:<9} {verdict:<8}")
+
+        rejected_rows = [r for r in available[:limit]
+                         if r.get('decision') is not None and not r['decision'].accept]
+        if rejected_rows:
+            print(f"\n{Colors.GRAY}Why rejected:{Colors.RESET}")
+            for r in rejected_rows[:5]:
+                print(f"  {Colors.GRAY}{r['symbol']:<10} {r['decision'].reason}{Colors.RESET}")
 
     # Separate spread-excluded from other unavailable
     spread_excluded = [r for r in unavailable if r.get('excluded_reason') == 'spread']
@@ -1747,152 +2054,177 @@ def display_funding_table(available: List[dict], unavailable: List[dict], curren
 
 # ==================== Position Recovery ====================
 
-async def verify_and_recover_position(state_mgr: StateManager, env: dict, aster: AsterApiManager) -> bool:
+async def reconcile_positions_at_boot(
+    state_mgr: StateManager,
+    env: dict,
+    aster: AsterApiManager,
+    config: BotConfig,
+) -> bool:
+    """Establish ground truth from both venues before trusting the state file.
+
+    Replaces verify_and_recover_position, which had two defects pointing the same way -
+    towards forgetting live money:
+
+    1. It cleared `current_position` from inside a bare `except Exception`, so a
+       transient API error at boot erased the bot's only record of a live hedge. That
+       also silently defeated the PositionFetchError raise in lighter_client: the
+       exception added there precisely so a failed read could NOT be mistaken for
+       "flat" was caught here and converted straight back into "flat".
+    2. It only ever inspected the ONE symbol named in the state file, so a live
+       position in any other symbol was invisible - including one in a symbol since
+       removed from `symbols_to_monitor`.
+
+    boot_reconcile queries account-level listings from both venues instead, and venue
+    truth outranks the state file unconditionally. The state file contributes metadata
+    (opened_at, capital_at_open) and nothing else.
+
+    Returns True when a valid hedged position is being held.
     """
-    Verify that a saved position actually exists on both exchanges.
-    Returns True if position is valid and should be held, False otherwise.
-    """
-    position = state_mgr.state.get("current_position")
-    if not position:
-        return False
+    api_client = lighter.ApiClient(configuration=lighter.Configuration(host=env["LIGHTER_BASE_URL"]))
+    account_api = lighter.AccountApi(api_client)
 
-    symbol = position.get("symbol")
-    if not symbol:
-        logger.warning("Position in state has no symbol, clearing...")
-        state_mgr.state["current_position"] = None
-        state_mgr.save()
-        return False
+    def _clean(sym: str) -> str:
+        return str(sym).upper().replace("USDT", "")
 
-    logger.info(f"\n{Colors.CYAN}═══════════════════════════════════════════════════════════════{Colors.RESET}")
-    logger.info(f"{Colors.CYAN}Position Recovery: Checking for existing {symbol} position...{Colors.RESET}")
-    logger.info(f"{Colors.CYAN}═══════════════════════════════════════════════════════════════{Colors.RESET}\n")
+    async def aster_positions() -> Dict[str, float]:
+        return {_clean(s): q for s, q in (await aster.get_all_perp_positions()).items()}
 
-    print(f"\n{Colors.CYAN}Attempting to recover position for {symbol}...{Colors.RESET}")
-    print(f"  Opened at: {position.get('opened_at', 'Unknown')}")
-    print(f"  Long:  {position.get('long_exchange', 'Unknown')}")
-    print(f"  Short: {position.get('short_exchange', 'Unknown')}\n")
+    async def lighter_positions() -> Dict[str, float]:
+        raw = await lighter_client.list_lighter_positions(account_api, env["ACCOUNT_INDEX"])
+        return {_clean(s): q for s, q in raw.items()}
 
-    api_client = None
+    position = state_mgr.state.get("current_position") or {}
+    state_symbol = _clean(position["symbol"]) if position.get("symbol") else None
+
     try:
-        # Get market details
-        symbol_clean = symbol.replace("USDT", "")
-
-        # Initialize Lighter client
-        api_client = lighter.ApiClient(configuration=lighter.Configuration(host=env["LIGHTER_BASE_URL"]))
-        order_api = lighter.OrderApi(api_client)
-        account_api = lighter.AccountApi(api_client)
-
-        # Get Lighter market ID
-        l_market_id, _, _ = await lighter_client.get_lighter_market_details(order_api, symbol_clean)
-
-        # Check Aster position
-        print(f"{Colors.CYAN}Checking positions on both exchanges...{Colors.RESET}")
-        aster_account = await aster.get_perp_account_info()
-        aster_positions = aster_account.get('positions', [])
-        aster_size = 0.0
-        for pos in aster_positions:
-            if pos.get('symbol') == symbol:
-                aster_size = float(pos.get('positionAmt', 0))
-                break
-        aster_color = Colors.YELLOW if abs(aster_size) > 0.0001 else Colors.GRAY
-        print(f"  {aster_color}Aster:   {aster_size:+.6f} {symbol_clean}{Colors.RESET}")
-
-        # Check Lighter position
-        lighter_size = await lighter_client.get_lighter_open_size(account_api, env["ACCOUNT_INDEX"], l_market_id, symbol=symbol_clean)
-        lighter_color = Colors.YELLOW if abs(lighter_size) > 0.0001 else Colors.GRAY
-        print(f"  {lighter_color}Lighter: {lighter_size:+.6f} {symbol_clean}{Colors.RESET}\n")
-
-        # Verify positions exist and are opposite (delta-neutral)
-        has_aster_pos = abs(aster_size) > 0.0001
-        has_lighter_pos = abs(lighter_size) > 0.0001
-
-        if has_aster_pos and has_lighter_pos:
-            # Check if positions are opposite (delta-neutral)
-            if (aster_size > 0 and lighter_size < 0) or (aster_size < 0 and lighter_size > 0):
-                print(f"{Colors.GREEN}✓ Valid delta-neutral position found!{Colors.RESET}")
-                print(f"  {Colors.CYAN}Resuming HOLDING state...{Colors.RESET}")
-
-                # Check if actual position size differs from saved size_base
-                metadata = position.get("metadata", {})
-                saved_size_base = metadata.get("size_base", 0.0)
-
-                # Get the absolute actual sizes (they should be equal on both exchanges)
-                actual_aster_size = abs(aster_size)
-                actual_lighter_size = abs(lighter_size)
-
-                # Use the average of both as the actual size
-                actual_size_base = (actual_aster_size + actual_lighter_size) / 2.0
-
-                # Check if there's a significant difference (more than 0.1% or 0.001 units)
-                size_diff = abs(actual_size_base - saved_size_base)
-                size_diff_pct = (size_diff / saved_size_base * 100) if saved_size_base > 0 else 0
-
-                if size_diff > 0.001 and size_diff_pct > 0.1:
-                    print(f"{Colors.YELLOW}⚠ Position size mismatch detected:{Colors.RESET}")
-                    print(f"  {Colors.GRAY}Saved size_base:  {saved_size_base:.6f} {symbol_clean}{Colors.RESET}")
-                    print(f"  {Colors.GRAY}Actual Aster:     {actual_aster_size:.6f} {symbol_clean}{Colors.RESET}")
-                    print(f"  {Colors.GRAY}Actual Lighter:   {actual_lighter_size:.6f} {symbol_clean}{Colors.RESET}")
-                    print(f"  {Colors.GREEN}Updating size_base to: {actual_size_base:.6f} {symbol_clean}{Colors.RESET}\n")
-
-                    logger.warning(
-                        f"Position size mismatch: saved={saved_size_base:.6f}, "
-                        f"actual_aster={actual_aster_size:.6f}, actual_lighter={actual_lighter_size:.6f}"
-                    )
-
-                    # Update the metadata with the actual size
-                    metadata["size_base"] = actual_size_base
-                    position["metadata"] = metadata
-                    state_mgr.save()
-
-                    logger.info(f"Updated size_base from {saved_size_base:.6f} to {actual_size_base:.6f}")
-                else:
-                    print(f"  {Colors.GREEN}Position size matches saved value: {saved_size_base:.6f} {symbol_clean}{Colors.RESET}\n")
-
-                # Calculate time remaining
-                target_close = from_iso_z(position["target_close_at"])
-                now = utc_now()
-                time_remaining = (target_close - now).total_seconds() / 3600
-
-                if time_remaining > 0:
-                    print(f"  {Colors.BLUE}Time remaining: {Colors.BOLD}{time_remaining:.2f} hours{Colors.RESET}\n")
-                else:
-                    print(f"  {Colors.YELLOW}Hold duration already complete, will close soon{Colors.RESET}\n")
-
-                logger.info(f"Position recovery successful for {symbol}")
-                return True
-            else:
-                print(f"{Colors.YELLOW}⚠ Positions exist but are not properly hedged:{Colors.RESET}")
-                print(f"  {Colors.YELLOW}Both positions are on the same side (not delta-neutral){Colors.RESET}")
-                print(f"  {Colors.RED}Clearing saved state. Please close positions manually.{Colors.RESET}\n")
-        elif has_aster_pos or has_lighter_pos:
-            print(f"{Colors.YELLOW}⚠ Partial position detected:{Colors.RESET}")
-            if has_aster_pos:
-                print(f"  {Colors.YELLOW}Aster has position but Lighter does not{Colors.RESET}")
-            else:
-                print(f"  {Colors.YELLOW}Lighter has position but Aster does not{Colors.RESET}")
-            print(f"  {Colors.RED}Clearing saved state. Please close positions manually.{Colors.RESET}\n")
-        else:
-            print(f"{Colors.GRAY}No positions found on either exchange.{Colors.RESET}")
-            print(f"  {Colors.GRAY}Clearing saved state and resuming normal operation.{Colors.RESET}\n")
-
-        # Clear invalid position from state
-        state_mgr.state["current_position"] = None
-        state_mgr.save()
-        logger.info(f"Position state cleared for {symbol}")
-        return False
-
-    except Exception as e:
-        print(f"{Colors.RED}Error during position recovery: {e}{Colors.RESET}")
-        print(f"  Clearing saved state for safety.\n")
-        logger.error(f"Position recovery failed: {e}", exc_info=True)
-
-        # Clear position state on error
-        state_mgr.state["current_position"] = None
-        state_mgr.save()
-        return False
+        decision = await boot_reconcile(
+            [("Aster", aster_positions), ("Lighter", lighter_positions)],
+            state_symbols=[state_symbol] if state_symbol else [],
+            configured_symbols=[_clean(s) for s in config.symbols_to_monitor],
+        )
     finally:
-        if api_client:
-            await api_client.close()
+        await api_client.close()
+
+    logger.info("Boot reconciliation: %s", decision.reason)
+    print(f"\n{Colors.CYAN}Boot reconciliation: {decision.reason}{Colors.RESET}")
+    for venue, positions in decision.positions.items():
+        if positions:
+            for sym, qty in sorted(positions.items()):
+                print(f"  {Colors.YELLOW}{venue:<8} {sym:<10} {qty:+.6f}{Colors.RESET}")
+        else:
+            print(f"  {Colors.GRAY}{venue:<8} flat{Colors.RESET}")
+
+    def _halt_and_raise(reason: str, symbol: str, detail: str, extra: dict) -> None:
+        write_halt(reason, symbol=symbol, venue="both",
+                   residual_qty=float("nan"), extra=extra)
+        print(f"\n{Colors.RED}{Colors.BOLD}{reason.upper()}: {detail}{Colors.RESET}")
+        print(f"  {Colors.YELLOW}A halt sentinel has been written. Resolve this on the "
+              f"venues, then remove halt.json to resume.{Colors.RESET}\n")
+        raise HaltedError(f"{reason}: {detail}")
+
+    # --- unhedged exposure is not something to trade around ---------------
+    one_legged = [c for c in decision.conflicts if c.get("kind") == "one_legged"]
+    if one_legged:
+        _halt_and_raise(
+            "one-legged position at boot",
+            one_legged[0]["symbol"],
+            "; ".join(f"{c['symbol']}: {c['legs']}" for c in one_legged),
+            {"conflicts": one_legged},
+        )
+
+    if decision.flat:
+        if position:
+            print(f"  {Colors.GRAY}State file referenced {state_symbol}, but neither "
+                  f"venue holds it. Clearing.{Colors.RESET}")
+            logger.info("Clearing stale position state for %s (both venues flat)", state_symbol)
+        state_mgr.state["current_position"] = None
+        state_mgr.save()
+        return False
+
+    # --- something is hedged on both venues -------------------------------
+    aster_book = decision.positions.get("Aster", {})
+    lighter_book = decision.positions.get("Lighter", {})
+    hedged = sorted(set(aster_book) & set(lighter_book))
+
+    if len(hedged) > 1:
+        _halt_and_raise(
+            "multiple hedged positions at boot", hedged[0],
+            f"this bot manages one position at a time, found {hedged}",
+            {"symbols": hedged},
+        )
+
+    symbol_clean = hedged[0]
+    aster_qty = aster_book[symbol_clean]
+    lighter_qty = lighter_book[symbol_clean]
+
+    if aster_qty * lighter_qty > 0:
+        _halt_and_raise(
+            "position is not delta-neutral at boot", symbol_clean,
+            f"both venues are on the SAME side (Aster {aster_qty:+.8g}, "
+            f"Lighter {lighter_qty:+.8g}) - that is doubled directional exposure, "
+            f"not a hedge",
+            {"aster": aster_qty, "lighter": lighter_qty},
+        )
+
+    actual_size = (abs(aster_qty) + abs(lighter_qty)) / 2.0
+    imbalance = abs(abs(aster_qty) - abs(lighter_qty))
+    full_symbol = f"{symbol_clean}{config.quote}"
+
+    if state_symbol == symbol_clean:
+        # Known position: keep its original clock and economics, correct its size.
+        saved_size = (position.get("metadata") or {}).get("size_base", 0.0)
+        if abs(actual_size - saved_size) > max(1e-9, 0.001 * max(actual_size, 1e-9)):
+            logger.warning(
+                "Position size corrected from state %.10g to venue truth %.10g %s",
+                saved_size, actual_size, symbol_clean,
+            )
+            position.setdefault("metadata", {})["size_base"] = actual_size
+        print(f"{Colors.GREEN}Resuming tracked {full_symbol} hedge "
+              f"({actual_size:.6f} {symbol_clean}){Colors.RESET}")
+    else:
+        # Hedged on both venues but absent from the state file. Adopting it is safer
+        # than ignoring it: an unmanaged hedge has no stop-loss and never gets closed,
+        # and the alternative - opening a second position alongside it - is exactly
+        # the failure this reconciliation exists to prevent. The hold clock restarts
+        # from now, because the real entry time is unknowable from here.
+        logger.warning("Adopting untracked hedged position in %s", full_symbol)
+        print(f"{Colors.YELLOW}Adopting untracked hedged position in {full_symbol}. "
+              f"Hold window restarts now.{Colors.RESET}")
+        position = {
+            "symbol": full_symbol,
+            "long_exchange": "Lighter" if lighter_qty > 0 else "Aster",
+            "short_exchange": "Aster" if lighter_qty > 0 else "Lighter",
+            "leverage": config.leverage,
+            "opened_at": utc_now_iso(),
+            "target_close_at": to_iso_z(utc_now() + timedelta(hours=config.hold_duration_hours)),
+            "metadata": {"size_base": actual_size, "avg_mid": 0.0},
+            "expected_net_apr": 0.0,
+            "actual_notional": 0.0,
+            "requested_notional": config.notional_per_position,
+            "notional_was_adjusted": False,
+            "capital_at_open": None,
+            "adopted_at_boot": True,
+        }
+        state_mgr.state["current_position"] = position
+
+    if imbalance > 0:
+        logger.warning(
+            "Legs are imbalanced by %.10g %s (Aster %.10g vs Lighter %.10g); the "
+            "difference is unhedged delta.",
+            imbalance, symbol_clean, abs(aster_qty), abs(lighter_qty),
+        )
+        print(f"  {Colors.YELLOW}Legs imbalanced by {imbalance:.8g} {symbol_clean} "
+              f"- that difference is unhedged.{Colors.RESET}")
+
+    try:
+        remaining = (from_iso_z(position["target_close_at"]) - utc_now()).total_seconds() / 3600
+        print(f"  {Colors.BLUE}Time remaining: {remaining:.2f} hours{Colors.RESET}\n")
+    except Exception:                                           # noqa: BLE001
+        logger.warning("Position has no usable target_close_at; closing on next check.")
+        position["target_close_at"] = utc_now_iso()
+
+    state_mgr.save()
+    return True
 
 
 # ==================== Funding Rate Display ====================
@@ -1943,6 +2275,28 @@ async def fetch_and_display_funding_rates(env: dict, aster: AsterApiManager, con
 
 # ==================== Main Bot Logic ====================
 
+async def halted_idle(reason: object) -> None:
+    """Stay alive, trade nothing, and keep saying why.
+
+    Exiting here would be worse than useless: docker-compose runs this bot with
+    `restart: unless-stopped`, so the container would come straight back, hit the same
+    sentinel and exit again - a crash loop that buries the one message explaining what
+    needs a human. Staying up idle keeps the process visible in `docker ps` and the
+    reason legible in `docker logs`.
+    """
+    logger.critical("HALTED: %s", reason)
+    print(f"\n{Colors.RED}{Colors.BOLD}{'=' * 80}\nBOT HALTED - NOT TRADING\n{'=' * 80}{Colors.RESET}")
+    print(f"  {Colors.YELLOW}{reason}{Colors.RESET}")
+    print(f"  {Colors.YELLOW}Check BOTH venues, then delete {HALT_FILENAME} to "
+          f"resume.{Colors.RESET}\n")
+    while True:
+        logger.critical(
+            "Bot is HALTED and will not trade. Check both venues, then remove %s to "
+            "resume. Reason: %s", HALT_FILENAME, reason,
+        )
+        await asyncio.sleep(300)
+
+
 async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, config_file: str):
     """Main bot loop."""
 
@@ -1955,21 +2309,37 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
         apiv1_private=env["ASTER_APIV1_PRIVATE"]
     )
 
-    # Perform position recovery check on startup
-    if state_mgr.state.get("current_position") is not None:
-        logger.info("Saved position detected, attempting recovery...")
-        position_valid = await verify_and_recover_position(state_mgr, env, aster)
-
-        if position_valid:
-            # Ensure state is set to HOLDING
-            if state_mgr.get_state() != BotState.HOLDING:
-                logger.info("Setting state to HOLDING after successful recovery")
-                state_mgr.set_state(BotState.HOLDING)
-        else:
-            # Position was cleared, set to IDLE
-            if state_mgr.get_state() == BotState.HOLDING:
-                logger.info("Setting state to IDLE after clearing invalid position")
-                state_mgr.set_state(BotState.IDLE)
+    # Reconcile against the venues on EVERY boot, not only when the state file happens
+    # to mention a position. A live hedge that is missing from the state file is
+    # exactly the case that must not be missed - and it is unreachable from a check
+    # gated on the state file already knowing about it.
+    #
+    # boot_reconcile calls assert_not_halted() internally, so this is also the point
+    # where a halt sentinel from a previous failure stops the bot.
+    logger.info("Reconciling positions against both venues...")
+    try:
+        holding = None
+        for attempt in range(1, 6):
+            try:
+                holding = await reconcile_positions_at_boot(state_mgr, env, aster, config)
+                break
+            except BootReconcileError as exc:
+                # A venue listing failed. That is NOT "flat" - retry rather than
+                # guessing, and never fall through to trading on an unknown state.
+                delay = min(60.0, 5.0 * attempt)
+                logger.error("Boot reconciliation attempt %d/5 failed: %s. Retrying in %.0fs",
+                             attempt, exc, delay)
+                await asyncio.sleep(delay)
+        if holding is None:
+            raise HaltedError(
+                "Could not establish position state from the venues after 5 attempts. "
+                "Refusing to trade against an unknown account state."
+            )
+        state_mgr.set_state(BotState.HOLDING if holding else BotState.IDLE)
+    except HaltedError as exc:
+        await aster.close()
+        await halted_idle(exc)
+        return
 
     # Fetch initial capital status
     logger.info("Fetching initial capital status from exchanges...")
@@ -2043,24 +2413,11 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                     continue
 
                 available.sort(key=lambda x: x["net_apr"], reverse=True)
-                display_funding_table(available, unavailable, current_symbol=None, limit=10)
 
-                candidates = [r for r in available if r["net_apr"] >= config.min_net_apr_threshold]
-
-                if not candidates:
-                    logger.info("No candidates meet minimum APR threshold, waiting...")
-                    state_mgr.set_state(BotState.WAITING)
-                    await asyncio.sleep(60)
-                    continue
-
-                # Try to open best position
-                best = candidates[0]
-                logger.info(f"\n{Colors.CYAN}Opening position for {best['symbol']} (Net APR: {best['net_apr']:.2f}%){Colors.RESET}")
-
-                state_mgr.set_state(BotState.OPENING)
-
-                # Update capital status and validate before opening
-                logger.info("Updating capital status before opening position...")
+                # Size FIRST, then judge. The entry decision depends on the notional
+                # actually being traded (fees and funding both scale with it), so the
+                # capital check has to come before the gate rather than after it.
+                logger.info("Updating capital status before evaluating candidates...")
                 capital_ok = await update_capital_status(env, aster, state_mgr, config)
 
                 if not capital_ok:
@@ -2069,7 +2426,6 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                     await asyncio.sleep(60)
                     continue
 
-                # Calculate affordable notional with safety margin
                 affordable_notional, was_adjusted = calculate_affordable_notional(state_mgr, config)
 
                 if affordable_notional <= 0:
@@ -2082,6 +2438,74 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                     state_mgr.set_state(BotState.WAITING)
                     await asyncio.sleep(300)  # Wait 5 minutes before checking again
                     continue
+
+                # Fee-aware entry gate.
+                #
+                # This replaces `net_apr >= min_net_apr_threshold`, where "net" only
+                # ever meant net of the OTHER LEG'S FUNDING - never net of trading
+                # cost. The bot recorded three "successful" cycles at $0.00 PnL while
+                # paying a full round trip on each, because nothing anywhere compared
+                # the spread it was capturing against the cost of capturing it.
+                #
+                # evaluate_entry discounts the observed rate (forward funding decays,
+                # the spot rate at entry is not the mean realised over a 24h hold),
+                # charges the round trip, and requires a margin over break-even. The
+                # configured min_net_apr_threshold is kept as an additional floor.
+                cost_model = build_cost_model(config)
+                break_even = break_even_apr_pct(cost_model, config.hold_duration_hours)
+                logger.info(
+                    "Entry gate: break-even %.2f%% APR at a %.1fh hold "
+                    "(round trip %.4f%%), floor %.2f%%, sizing $%,.2f",
+                    break_even, config.hold_duration_hours, cost_model.roundtrip_pct(),
+                    config.min_net_apr_threshold, affordable_notional,
+                )
+
+                for row in available:
+                    row["decision"] = evaluate_entry(
+                        symbol=row["symbol"],
+                        gross_net_apr_pct=row["net_apr"],
+                        notional_usd=affordable_notional,
+                        hold_hours=config.hold_duration_hours,
+                        cost=cost_model,
+                    )
+
+                display_funding_table(available, unavailable, current_symbol=None, limit=10)
+
+                candidates = [
+                    r for r in available
+                    if r["decision"].accept and r["net_apr"] >= config.min_net_apr_threshold
+                ]
+                # Rank by expected dollars, not by headline APR: two rows with the same
+                # gross spread are not equally good once their break-evens differ.
+                candidates.sort(key=lambda r: r["decision"].expected_net_usd, reverse=True)
+
+                if not candidates:
+                    best_row = available[0]
+                    logger.info(
+                        "No candidate clears the fee-aware gate. Best was %s at %.2f%% "
+                        "gross (%s). Waiting...",
+                        best_row["symbol"], best_row["net_apr"], best_row["decision"].reason,
+                    )
+                    state_mgr.set_state(BotState.WAITING)
+                    await asyncio.sleep(60)
+                    continue
+
+                # Refuse to open on top of an unresolved failure. A halt sentinel means
+                # a previous unwind left real exposure behind; `restart: unless-stopped`
+                # would otherwise bring the container straight back here and stack a
+                # fresh position on top of it.
+                assert_not_halted()
+
+                best = candidates[0]
+                decision = best["decision"]
+                logger.info(
+                    f"\n{Colors.CYAN}Opening {best['symbol']}: gross {best['net_apr']:.2f}% -> "
+                    f"expected {decision.expected_apr_pct:.2f}% vs break-even "
+                    f"{decision.break_even_apr_pct:.2f}% ({decision.margin_ratio:.2f}x), "
+                    f"expected net ${decision.expected_net_usd:+.2f}{Colors.RESET}"
+                )
+
+                state_mgr.set_state(BotState.OPENING)
 
                 try:
                     metadata = await open_delta_neutral_position(
@@ -2105,6 +2529,22 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                         "target_close_at": to_iso_z(utc_now() + timedelta(hours=config.hold_duration_hours)),
                         "metadata": metadata,
                         "expected_net_apr": best['net_apr'],
+                        # The economics this trade was accepted on, recorded so a
+                        # post-mortem can compare what was expected against the
+                        # realised PnL rather than re-deriving it from a changed config.
+                        "entry_economics": {
+                            "gross_apr_pct": decision.gross_apr_pct,
+                            "expected_apr_pct": decision.expected_apr_pct,
+                            "break_even_apr_pct": decision.break_even_apr_pct,
+                            "margin_ratio": decision.margin_ratio,
+                            "expected_funding_usd": decision.expected_funding_usd,
+                            "expected_cost_usd": decision.expected_cost_usd,
+                            "expected_net_usd": decision.expected_net_usd,
+                            "hold_hours": config.hold_duration_hours,
+                            "roundtrip_pct": cost_model.roundtrip_pct(),
+                            "aster_interval_hours": best.get("aster_interval_hours"),
+                            "aster_interval_source": best.get("aster_interval_source"),
+                        },
                         "actual_notional": affordable_notional,
                         "requested_notional": config.notional_per_position,
                         "notional_was_adjusted": was_adjusted,
@@ -2156,57 +2596,9 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                         # the bot reported 3 "successful" cycles at $0.00 PnL while
                         # actually paying a round trip on each. A bot that cannot see
                         # its own losses cannot be told it is losing.
-                        #
-                        # Realised PnL is measured the only way that is trustworthy:
-                        # total capital after minus total capital before. That
-                        # captures funding, fees and slippage together, with no model
-                        # to be wrong about.
-                        stats = state_mgr.state["cumulative_stats"]
-                        cap_before = position.get("capital_at_open")
-                        cycle_pnl = None
-                        try:
-                            if await update_capital_status(env, aster, state_mgr, config):
-                                cap_now = state_mgr.state["capital_status"].get("total_capital")
-                                if cap_before is not None and cap_now:
-                                    cycle_pnl = float(cap_now) - float(cap_before)
-                        except Exception as e:                       # noqa: BLE001
-                            logger.warning("Could not measure realised cycle PnL: %s", e)
-
-                        roundtrip_pct = 0.080   # Aster taker 0.040% x2 legs; Lighter is zero-fee
-                        est_fees = position.get("actual_notional", 0.0) * roundtrip_pct / 100.0
-
-                        state_mgr.state["completed_cycles"].append({
-                            "symbol": position["symbol"],
-                            "opened_at": position["opened_at"],
-                            "closed_at": utc_now_iso(),
-                            "expected_net_apr": position.get("expected_net_apr", 0.0),
-                            "notional": position.get("actual_notional", 0.0),
-                            "realized_pnl": cycle_pnl,
-                            "estimated_fees": est_fees,
-                            "status": "success"
-                        })
-                        stats["total_cycles"] += 1
-                        stats["successful_cycles"] += 1
-                        stats["total_fees_paid"] = stats.get("total_fees_paid", 0.0) + est_fees
-                        if cycle_pnl is not None:
-                            stats["total_realized_pnl"] = stats.get("total_realized_pnl", 0.0) + cycle_pnl
-                            stats["best_cycle_pnl"] = max(stats.get("best_cycle_pnl", 0.0), cycle_pnl)
-                            stats["worst_cycle_pnl"] = min(stats.get("worst_cycle_pnl", 0.0), cycle_pnl)
-                            pnl_color = Colors.GREEN if cycle_pnl >= 0 else Colors.RED
-                            logger.info(
-                                f"Cycle realised PnL: {pnl_color}${cycle_pnl:+.4f}{Colors.RESET} "
-                                f"| cumulative: ${stats['total_realized_pnl']:+.4f} "
-                                f"over {stats['successful_cycles']} cycle(s)"
-                            )
-                            if stats["total_realized_pnl"] < 0 and stats["successful_cycles"] >= 3:
-                                logger.warning(
-                                    f"{Colors.YELLOW}Cumulative realised PnL is NEGATIVE "
-                                    f"(${stats['total_realized_pnl']:+.4f} over "
-                                    f"{stats['successful_cycles']} cycles). The configured "
-                                    f"threshold may not be clearing round-trip costs.{Colors.RESET}"
-                                )
-                        else:
-                            logger.warning("Cycle PnL unmeasured - capital snapshot unavailable.")
+                        await record_cycle_result(
+                            state_mgr, env, aster, config, position, "success",
+                        )
 
                         state_mgr.state["current_position"] = None
                         state_mgr.set_state(BotState.WAITING)
@@ -2284,19 +2676,19 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                                 try:
                                     await close_delta_neutral_position(env, aster, position["symbol"], cross_ticks=100)
 
-                                    # Mark cycle as stopped-loss in completed_cycles
-                                    state_mgr.state["completed_cycles"].append({
-                                        "symbol": position["symbol"],
-                                        "opened_at": position["opened_at"],
-                                        "closed_at": utc_now_iso(),
-                                        "expected_net_apr": position.get("expected_net_apr", 0.0),
-                                        "status": "stop-loss",
-                                        "pnl_at_close": worst_pnl,
-                                        "pnl_pct_at_close": pnl_pct,
-                                        "worst_exchange": worst_exchange
-                                    })
-                                    state_mgr.state["cumulative_stats"]["total_cycles"] += 1
-                                    state_mgr.state["cumulative_stats"]["failed_cycles"] += 1
+                                    # Measure realised PnL here too. A stop-loss cycle
+                                    # is precisely the kind this bot most needs to
+                                    # count: excluding it from total_realized_pnl was
+                                    # what let the "cumulative PnL is negative" check
+                                    # look healthy while the losing cycles piled up.
+                                    await record_cycle_result(
+                                        state_mgr, env, aster, config, position, "stop-loss",
+                                        extra={
+                                            "pnl_at_close": worst_pnl,
+                                            "pnl_pct_at_close": pnl_pct,
+                                            "worst_exchange": worst_exchange,
+                                        },
+                                    )
                                     state_mgr.state["current_position"] = None
                                     state_mgr.save()
 
@@ -2401,6 +2793,13 @@ async def main_loop(state_mgr: StateManager, env: dict, config: BotConfig, confi
                 logger.warning(f"Unknown state: {current_state}, resetting to IDLE")
                 state_mgr.set_state(BotState.IDLE)
 
+    except HaltedError as exc:
+        # Raised by assert_not_halted() before an open, or by a close that could not
+        # flatten. Idle loudly instead of exiting - see halted_idle().
+        state_mgr.state["cumulative_stats"]["last_error"] = str(exc)
+        state_mgr.state["cumulative_stats"]["last_error_at"] = utc_now_iso()
+        state_mgr.save()
+        await halted_idle(exc)
     finally:
         await aster.close()
 
@@ -2414,7 +2813,16 @@ def main():
 
     # Load environment and config
     env = load_env()
-    config = BotConfig.load_from_file(args.config)
+    try:
+        config = BotConfig.load_from_file(args.config)
+    except ConfigError as exc:
+        # Fatal on purpose. Starting on defaults means trading a different strategy
+        # than the one that was configured, at 3x leverage and a 5% APR gate.
+        logger.critical("%s", exc)
+        print(f"\n{Colors.RED}{Colors.BOLD}CONFIGURATION ERROR{Colors.RESET}\n  {exc}\n")
+        print(f"  {Colors.YELLOW}Fix {args.config} and start again. The bot will not "
+              f"run on built-in defaults.{Colors.RESET}\n")
+        sys.exit(2)
 
     # Initialize state manager
     state_mgr = StateManager(args.state_file)

@@ -18,7 +18,10 @@ Usage:
 import asyncio
 import os
 import sys
-from datetime import datetime, UTC
+# `datetime.UTC` is 3.11+. The Docker image is 3.12 so it worked there, but this script
+# is documented as something you run by hand during an incident - and the machine you
+# reach for then may not be the container. timezone.utc is equivalent and works on 3.8+.
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import lighter
 
@@ -44,7 +47,7 @@ def print_header():
     print(f"\n{Colors.BOLD}{Colors.RED}{'═' * 100}")
     print(f"{'EMERGENCY EXIT - DELTA NEUTRAL POSITION CLOSER':^100}")
     print(f"{'═' * 100}{Colors.RESET}\n")
-    print(f"{Colors.GRAY}Timestamp: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC{Colors.RESET}\n")
+    print(f"{Colors.GRAY}Timestamp: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC{Colors.RESET}\n")
 
 
 def load_env() -> dict:

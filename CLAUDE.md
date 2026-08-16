@@ -71,11 +71,23 @@ The main bot (`lighter_aster_hedge.py`) operates as a state machine with these s
 - `fetch_and_display_funding_rates()` - Displays opportunity analysis table
 - `get_aster_balance()` / `get_lighter_balance()` - Balance fetchers for both exchanges
 
-**Exchange Connectors** (DO NOT MODIFY):
+**Exchange Connectors** (avoid modifying; see exception below):
 - `lighter_client.py` - Lighter exchange API wrapper
 - `aster_api_manager.py` - Aster exchange API wrapper
 - `utils.py` - Helper utilities for Aster connector
 - `strategy_logic.py` - Required stub for Aster connector
+
+> **Exception.** The two-leg primitive requires capabilities the upstream connectors did
+> not have, so these were added here and must be mirrored back to the source projects:
+> `aster_api_manager.get_perp_open_orders / cancel_all_perp_orders / get_funding_info /
+> get_all_perp_positions`, and `lighter_client.lighter_cancel_open_orders /
+> list_lighter_positions`.
+
+**Shared Safety Modules** (byte-identical across every bot in this family — change here
+and re-copy, never fork):
+- `two_leg.py` - two-leg execution, fill verification, unwind, halt sentinel,
+  boot reconciliation
+- `funding_economics.py` - funding-interval resolution and the fee-aware entry gate
 
 **Utility Scripts**:
 - `check_lighter_positions.py` - Standalone position checker
@@ -129,12 +141,17 @@ The bot saves state to `bot_state.json` containing:
 - Cumulative statistics (cycle counts, errors)
 
 **Startup Sequence**:
-1. Load state and recover position if exists (`verify_and_recover_position()`)
-2. Fetch and display capital status (`update_capital_status()`)
-3. Display initial funding rate table (`fetch_and_display_funding_rates()`)
-4. Enter main loop
+1. Load config — **fatal** on any error (see Configuration below)
+2. Reconcile against both venues (`reconcile_positions_at_boot()`), which also checks
+   the halt sentinel via `assert_not_halted()`
+3. Fetch and display capital status (`update_capital_status()`)
+4. Display initial funding rate table (`fetch_and_display_funding_rates()`)
+5. Enter main loop
 
-**Important**: The bot can recover from crashes by loading this state file. If a position exists in state, the bot calls `verify_and_recover_position()` on startup to validate the position still exists on both exchanges.
+**Important**: reconciliation runs on **every** boot, not only when the state file
+mentions a position — a live hedge missing from the state file is exactly the case that
+must not be missed, and it is unreachable from a check gated on the state file already
+knowing about it.
 
 ### Rate Limiting & Error Handling
 
@@ -172,8 +189,39 @@ Key parameters:
 - `leverage` - 1-5x recommended (higher = more liquidation risk)
 - `notional_per_position` - Max requested USD size per trade (auto-adjusted if insufficient capital)
 - `capital_safety_margin` - Percentage of available capital to use (0.95 = 95%, keeps 5% buffer for fees/slippage)
-- `hold_duration_hours` - 8h recommended (1 full Lighter funding cycle)
-- `min_net_apr_threshold` - Minimum APR to open (5.0 = 5% annualized)
+- `hold_duration_hours` - **24h**. Break-even scales as `roundtrip_pct x (8760/hold)`,
+  so 8h needs 87.6% APR to break even while 24h needs 29.2%. Longer holds are the lever
+  that works; raising the threshold alone is not.
+- `min_net_apr_threshold` - a *floor* applied on top of the fee-aware gate, not the gate
+  itself (60.0 = 60% annualized)
+- `slippage_bps_per_leg` - per-leg one-way slippage added to the venue taker fee.
+  Defaults to 0.0, which reproduces the historical fee-only round trip (0.080%) and is
+  almost certainly optimistic. Calibrate from realised fills.
+
+> **Config loading is fatal on error.** An unreadable, unknown-key, or out-of-range
+> config raises `ConfigError` and the bot exits(2) rather than starting on built-in
+> defaults. This is not paranoia: the previous filter dropped only keys starting with
+> `comment`, so the `_comment_*` keys in `config.json` reached `BotConfig(**data)`,
+> raised `TypeError`, and were swallowed into an all-defaults fallback — the bot silently
+> ran at 3x leverage, an 8h hold and a 5% gate while `config.json` asked for 1x, 24h and
+> 60%. Keys containing "comment" are ignored; anything else unrecognised is an error, so
+> a typo in a risk parameter can never silently take a default.
+
+### Entry Gate (`funding_economics.evaluate_entry`)
+
+Candidates are no longer filtered on `net_apr >= threshold`, where "net" only ever meant
+net of the *other leg's funding* and never of trading cost. Each candidate is now
+evaluated at the **actual affordable notional** (so the capital check runs before the
+gate, not after) and must clear all of:
+
+- expected net USD > 0, where expected APR applies a 30% haircut for forward-funding decay,
+- `margin_ratio >= 2.0` against the break-even implied by the round trip and hold length,
+- `min_net_apr_threshold` as a floor.
+
+At the configured 24h hold and 0.080% round trip this accepts from roughly **83% gross
+APR** upward — noticeably stricter than the bare 60% floor, and deliberately so. The
+opportunity table prints expected APR, break-even, margin and expected net dollars per
+row, plus the rejection reason, so a quiet bot explains itself.
 - `max_spread_pct` - Maximum cross-exchange price difference (0.15 = 0.15%)
 - `enable_stop_loss` - Enable automatic stop-loss execution (true/false)
 - `funding_table_refresh_minutes` - How often to refresh opportunity table while holding (5.0 = every 5 minutes)
@@ -199,12 +247,54 @@ The bot verifies Aster leverage after setting but cannot verify Lighter (only ap
 ### Order Types
 
 **Opening**:
-- Lighter: Aggressive limit orders (IOC) that cross the spread by `cross_ticks`
-- Aster: Market orders
+- Lighter: aggressive limit orders that cross the spread by `cross_ticks`, sent
+  **GOOD_TILL_TIME** — *not* IOC, as this file previously claimed. That distinction is
+  the whole reason Lighter is the pilot leg: a GTT remainder rests on the book and can
+  fill minutes later, so it must be cancelled and verified before the hedge is committed.
+- Aster: market orders
 
 **Closing**:
-- Lighter: Reduce-only aggressive limit orders
-- Aster: Reduce-only market orders
+- Lighter: reduce-only aggressive limit orders (also GOOD_TILL_TIME)
+- Aster: reduce-only market orders
+
+### Two-Leg Execution (`two_leg.py`)
+
+Opening and closing both run through the shared primitive rather than
+`asyncio.gather` + "assume it worked":
+
+- **Sequential, not parallel.** `execute_two_leg` submits the pilot (Lighter), cancels
+  its remainder, reads the position back, and only then sizes and submits the hedge
+  (Aster) **from what actually filled**. Parallel submission maximises the window where
+  both legs are live and unverified.
+- **Submission never means filled.** Only a position read can promote a leg to FILLED.
+- **Failure unwinds.** If the hedge does not complete, the pilot is unwound. If an
+  unwind cannot complete, a `halt.json` sentinel is written.
+- `HedgeVenues` in `lighter_aster_hedge.py` builds the `LegSpec`s. All venue coupling
+  lives there; `two_leg.py` imports no exchange client.
+
+### Halt Sentinel — operator procedure
+
+`halt.json` in the working directory means the bot found real, unhedged, unmanaged
+exposure and has stopped trading. It is written when:
+
+- an unwind failed after its retries,
+- a close could not flatten a leg,
+- boot reconciliation found a one-legged, same-side, or multi-symbol position.
+
+While it exists the bot **stays running and idle**, logging the reason every 5 minutes.
+It deliberately does not exit: `restart: unless-stopped` would otherwise crash-loop it
+and bury the message.
+
+To clear it:
+
+1. Read `halt.json` — it records the symbol, venue and residual quantity.
+2. Check **both** venues by hand (`python check_lighter_positions.py`, and the Aster UI).
+3. Flatten or hedge whatever is left, e.g. `python emergency_exit.py`.
+4. Delete `halt.json`.
+5. Restart the bot.
+
+Never delete it without checking the venues — it exists precisely because the bot could
+not confirm what it left behind.
 
 ### Position Verification
 
@@ -215,6 +305,15 @@ After opening, the bot verifies positions via:
 The verification is non-blocking (continues even if verification fails).
 
 ### Funding Rate Calculations
+
+> **Implementation note.** Interval resolution goes through
+> `funding_economics.FundingIntervalResolver`, not ad-hoc code in the bot:
+> `resolve_from_api_field('aster', symbol, ...)` reads `fundingIntervalHours` from
+> `AsterApiManager.get_funding_info()`, falling back to `resolve_empirically` over 50
+> history records (needs ≥8 samples and ≥75% agreement). **A symbol whose interval
+> cannot be resolved is skipped, never defaulted.** The old code read two records, took
+> the single gap between them, and fell back to `periods_per_day = 6` — which doubled
+> the reported APR on every 8h symbol, i.e. most of the configured universe.
 
 **Aster**: Funding interval varies by symbol (detected dynamically). Verified from raw
 `nextFundingTime` values in this repo's own logs — **three intervals run simultaneously**:
@@ -364,15 +463,27 @@ To debug rate limit issues, check the log file for:
 
 ### Manual State Recovery
 
-If the bot's state becomes corrupted:
+Mostly unnecessary now — **venue truth outranks the state file**. On every boot
+`reconcile_positions_at_boot` queries account-level position listings from both venues
+and reconciles against them, so the state file is no longer the thing that decides what
+is open. It contributes metadata (`opened_at`, `capital_at_open`) and nothing else.
 
-1. Backup `bot_state.json`
-2. Check actual positions: `python check_lighter_positions.py`
-3. If positions exist but bot doesn't know about them:
-   - Option A: Close manually via exchange UIs
-   - Option B: Delete `bot_state.json` and let bot start fresh (WARNING: bot won't track these positions)
-4. If bot shows position but none exist:
-   - Delete `bot_state.json` to reset
+What the reconciler does with what it finds:
+
+| Found on venues | Action |
+|---|---|
+| Nothing | clears any stale `current_position`, starts fresh |
+| Hedged, matches state | resumes HOLDING, corrects `size_base` to venue truth |
+| Hedged, absent from state | **adopts** it (hold window restarts now) rather than opening a second position beside it |
+| One-legged | **halts** — that is live directional exposure the bot did not intend |
+| Same side on both venues | **halts** — doubled exposure, not a hedge |
+| More than one hedged symbol | **halts** — this bot manages one position at a time |
+| A venue listing fails | retries 5x, then halts — a failed read is *not* "flat" |
+
+So: **do not delete `bot_state.json` to fix a stuck position.** It no longer helps (the
+bot rediscovers positions from the venues) and it destroys the `capital_at_open`
+baseline that realised-PnL measurement depends on. If something is genuinely wrong, read
+`halt.json`, check both venues, and use `python emergency_exit.py`.
 
 ## Exchange Connector Notes
 
